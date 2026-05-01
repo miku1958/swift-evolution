@@ -583,6 +583,7 @@ func doBothThings() throws(NetworkError | FilesystemError) {
 
 The runtime thrown value is always *one concrete leaf* — both leaves of `doAnotherThing`'s declared set are accepted by `doBothThings`'s declared set, so the propagation type-checks without cost. This is the same posture [SE-0413] already takes for `throws(SpecificError) → throws(any Error)` widening, generalised from "subtype of `any Error`" to "leaf-set subset of the outer's declared set with per-leaf class/protocol subtyping". Spelling-as-identity still applies at *type-identity* boundaries — value-level cross-shape assignment, protocol-witness conformance, mangling — but those are signature questions, not propagation questions. The composition story in [Motivation](#motivation) (`O(N+M)` rather than `O(N×M)`) leans entirely on this rule: cross-library throws sets compose at the propagation boundary, not at the signature boundary.
 
+<a id="uninhabited-never-leaves-and-the-inhabited-subset-rule"></a>
 **Uninhabited (`Never`) leaves and the inhabited-subset rule.** `Never` is the bottom type — no value of type `Never` can be constructed. When `Never` appears as a leaf in a narrowed-`Any`, the runtime can never see a value of that leaf, so call-site **reachability** checks ("can this throw?", "is this case reachable?", "does this cast have any chance of succeeding?") are decided against the *inhabited* subset of the leaf set, not the static leaf set. Concretely:
 
 - `throws(A | Never)`: inhabited subset `{A}` → `try` required at call site, exactly like `throws(A)`.
