@@ -566,6 +566,7 @@ The body type-checks against the *join* of the constraint's leaves — the body 
 
 **Throws position.** `throws(A | B)` is a *type position* (not a constraint position): the spelling is part of the function signature's identity. A protocol method declared `throws(NetworkError | DecodingError)` and an implementation written `throws(DecodingError | NetworkError)` are two *different* signatures; the compiler reports "does not conform to protocol" with a fix-it that reorders the implementation. Constraint-position order-freeness does not extend to type-position. § [Issue 6](#issue-6-generic-constraints-where-t-a--b) covers the asymmetry.
 
+<a id="try-propagation-is-per-leaf-not-per-spelling"></a>
 **Try-propagation is per-leaf, not per-spelling.** Spelling-as-identity at the throws *signature* (above) does *not* extend to the `try f()` propagation site. Propagation is a value-flow check: each leaf the inner call could throw must have a home in the enclosing function's declared throws set, regardless of how either side spelled the alternation. Concretely:
 
 ```swift
