@@ -884,9 +884,16 @@ Today the user writing `arr.xxx()` where `arr: [Int | String]` and `xxx()` is de
 
 A macro that *generates* `A | B` works today by textual expansion. A macro that wants to *receive* a narrowed-`Any` and reflect over its alternatives needs `swift-syntax` to expose a `NarrowedAnyTypeRepr` accessor. The underlying syntax node already exists in the prototype's swift-syntax fork ([miku1958/swift-syntax][fork-syntax], branch [`narrowed-any/syntax-sync`][fork-syntax-branch]); reflecting it through `MacroExpansion` is a follow-up macro-proposal.
 
-### Tagged-union layout for small POD leaf sets
+### Tagged-union layout for small POD leaf sets (and the Embedded Swift story)
 
 When every leaf is small and POD (`Bool | UInt8`, `Int8 | Int16`), the existential layout is wasteful — a 24-byte inline buffer plus a metadata pointer for what could fit in two bytes. An IRGen pass could lay out such narrowed-`Any` values as `discriminator + payload` locally, the way `Optional<Int>` packs into a spare-bit representation today. Cross-module ABI continues to use the existential layout; the optimisation is local-only.
+
+**This layout is required, not just nice-to-have, for Embedded Swift.** Embedded targets restrict dynamic dispatch, existential boxing, and `swift_dynamicCast` — exactly the v1 mechanisms narrowed-`Any` reuses on full-Swift targets. Without the tagged-union layout, Embedded Swift cannot adopt the feature; with it, narrowed-`Any` lands in the same perf regime as a hand-written wrapper enum on Embedded (discriminator + max-payload size, no metadata indirection, no dynamic cast). [SE-0413]'s perf wins are concentrated in single-leaf typed throws (fixed-size stack-resident error, no boxing); the moment a function wraps a multi-case enum to compose multiple error sources, payload + discriminator is already the regime — narrowed-`Any` under tagged-union layout matches that regime, just without the named-wrapper-enum tax. This means:
+
+- **v1** (full-Swift, no Embedded): existential layout + `swift_dynamicCast`. The `O(N+M)` ergonomic improvement over wrapper enums is delivered immediately; the runtime cost vs a hand-written wrapper enum is the existential indirection (an extra metadata pointer + the `swift_dynamicCast` lookup at the catch arm).
+- **v1 + 1** (Embedded Swift unblocked): tagged-union layout for small POD leaf sets (typed-throws errors usually fit), `discriminator + payload` local emission, no `swift_dynamicCast` on the catch path. Same ABI for cross-module so libraries compiled with v1 keep working when re-imported under v1+1.
+
+The layout transformation is a local IRGen pass — no ABI changes, no new metadata kinds, no language-rule changes. It can ship in a separate proposal once Embedded-Swift's narrowed-`Any` story is mature enough for review.
 
 ### Reflection over the closed leaf set
 
