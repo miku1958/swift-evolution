@@ -890,10 +890,10 @@ When every leaf is small and POD (`Bool | UInt8`, `Int8 | Int16`), the existenti
 
 **This layout is required, not just nice-to-have, for Embedded Swift.** Embedded targets restrict dynamic dispatch, existential boxing, and `swift_dynamicCast` — exactly the v1 mechanisms narrowed-`Any` reuses on full-Swift targets. Without the tagged-union layout, Embedded Swift cannot adopt the feature; with it, narrowed-`Any` lands in the same perf regime as a hand-written wrapper enum on Embedded (discriminator + max-payload size, no metadata indirection, no dynamic cast). [SE-0413]'s perf wins are concentrated in single-leaf typed throws (fixed-size stack-resident error, no boxing); the moment a function wraps a multi-case enum to compose multiple error sources, payload + discriminator is already the regime — narrowed-`Any` under tagged-union layout matches that regime, just without the named-wrapper-enum tax. This means:
 
-- **v1** (full-Swift, no Embedded): existential layout + `swift_dynamicCast`. The `O(N+M)` ergonomic improvement over wrapper enums is delivered immediately; the runtime cost vs a hand-written wrapper enum is the existential indirection (an extra metadata pointer + the `swift_dynamicCast` lookup at the catch arm).
-- **v1 + 1** (Embedded Swift unblocked): tagged-union layout for small POD leaf sets (typed-throws errors usually fit), `discriminator + payload` local emission, no `swift_dynamicCast` on the catch path. Same ABI for cross-module so libraries compiled with v1 keep working when re-imported under v1+1.
+- **This proposal (v1, full-Swift, no Embedded)** ships with the existential layout + `swift_dynamicCast`. The `O(N+M)` ergonomic improvement over wrapper enums is delivered immediately; the runtime cost vs a hand-written wrapper enum is the existential indirection (an extra metadata pointer + the `swift_dynamicCast` lookup at the catch arm).
+- **A follow-up proposal (Embedded Swift unblocked)** ships the tagged-union layout for small POD leaf sets (typed-throws errors usually fit), with `discriminator + payload` local emission and no `swift_dynamicCast` on the catch path. Cross-module ABI continues to use the existential layout, so libraries compiled against v1 keep working when re-imported under the follow-up.
 
-The layout transformation is a local IRGen pass — no ABI changes, no new metadata kinds, no language-rule changes. It can ship in a separate proposal once Embedded-Swift's narrowed-`Any` story is mature enough for review.
+The layout transformation is a local IRGen pass — no ABI changes, no new metadata kinds, no language-rule changes. It can ship as a separate SE proposal once the Embedded-Swift narrowed-`Any` story is mature enough for review.
 
 ### Reflection over the closed leaf set
 
