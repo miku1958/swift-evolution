@@ -270,6 +270,7 @@ The user types `Int | String | Bool` and the compiler computes the same flat lea
 
 IDE completion follows the depth-1 rule: a switch on `(A | B) | C` with no body suggests `case let _ as A`, `case let _ as B`, `case let _ as C` — three flat arms, not "narrow first, then expand".
 
+<a id="real-world-buildeither-example"></a>
 A real-world example of structurally-nested-behaviourally-flat already in shipping Swift: result-builder `if / else if / else` chains. SwiftUI's `ViewBuilder` produces `_ConditionalContent<_ConditionalContent<A, B>, C>` for a three-arm chain — depth-2 nesting at the type-identity level (each `else` introduces another wrapper layer), but pattern-matching on the resulting view is flat (`Mirror` and SwiftUI's own dispatch walk the deep set). Replacing `_ConditionalContent<T, F>` with `T | F` (a [Future-direction follow-up](#result-builders-simplifying-buildeither-and-the-_conditionalcontent-ladder)) collapses the wrapper struct but inherits the same depth-1 principle for free: `A | B | C` (flat) and `(A | B) | C` (depth-2) are different identities, but a `switch` over either still walks `{A, B, C}` directly.
 
 ### Spelling is identity
