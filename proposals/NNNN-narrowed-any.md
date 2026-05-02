@@ -884,6 +884,40 @@ Today the user writing `arr.xxx()` where `arr: [Int | String]` and `xxx()` is de
 
 A macro that *generates* `A | B` works today by textual expansion. A macro that wants to *receive* a narrowed-`Any` and reflect over its alternatives needs `swift-syntax` to expose a `NarrowedAnyTypeRepr` accessor. The underlying syntax node already exists in the prototype's swift-syntax fork ([miku1958/swift-syntax][fork-syntax], branch [`narrowed-any/syntax-sync`][fork-syntax-branch]); reflecting it through `MacroExpansion` is a follow-up macro-proposal.
 
+### Result builders: simplifying `buildEither` and the `_ConditionalContent` ladder
+
+Result builders ([SE-0289](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0289-result-builders.md)) introduced `buildEither(first:)` / `buildEither(second:)` for `if / else` branches whose two arms produce different `Component` types. Today every result builder author has to invent a sum-type wrapper — SwiftUI's [`_ConditionalContent<T, F>`](https://developer.apple.com/documentation/swiftui/viewbuilder/buildeither(first:)) is the canonical example — and an `if / else if / else` chain produces a *nested* wrapper tree (`_ConditionalContent<_ConditionalContent<A, B>, C>`) whose depth scales with branch count.
+
+`A | B` collapses both pieces of this ceremony:
+
+```swift
+// Today (SwiftUI's ViewBuilder, abridged):
+@resultBuilder struct ViewBuilder {
+    static func buildEither<T: View, F: View>(first:  T) -> _ConditionalContent<T, F>
+    static func buildEither<T: View, F: View>(second: F) -> _ConditionalContent<T, F>
+}
+
+// With narrowed-`Any` — wrapper struct retired:
+@resultBuilder struct ViewBuilder {
+    static func buildEither<T: View, F: View>(first:  T) -> T | F
+    static func buildEither<T: View, F: View>(second: F) -> T | F
+}
+```
+
+Two follow-on improvements ride on the same change:
+
+- **Flat `n`-ary `if / else if / else`.** A three-arm chain can produce a flat `A | B | C` rather than the depth-2 `_ConditionalContent<_ConditionalContent<A, B>, C>` ladder. Whether to emit flat or nested is a deliberate result-builder design choice — flat preserves user-source order and is what most readers expect; the nested form is what existing builders happen to produce because it's all `_ConditionalContent` could express.
+- **Loop bodies with heterogeneous arms.** `buildArray` over a `for` whose body branches between `A` and `B` could produce `[A | B]` directly instead of `[_ConditionalContent<A, B>]`. Same erasure improvements apply.
+
+Open design questions for the follow-up proposal:
+
+- **Spelling-as-identity at builder boundaries.** `if cond { A() } else { B() }` produces `A | B`; `if !cond { B() } else { A() }` would produce `B | A`. Per [Spelling is identity](#spelling-is-identity) those are different types — different mangled names, different Codable order, different `View` witness selection. Today's `_ConditionalContent<T, F>` already has this property (the type parameter order encodes the source order); narrowed-`Any` makes it more visible. The right design probably commits to *source order* as the rule and surfaces a "consider reordering branches if Codable order matters" warning at large builders.
+- **Same-type collapse.** `if cond { A() } else { A() }` produces `A | A` per spelling-as-identity (two leaves of the same type, no idempotence). Today `_ConditionalContent<A, A>` is similar — it works, with no perf benefit over `A` alone. Should the result builder's `buildEither` collapse same-type branches to `A`? If yes, that's a builder-side rule, not a language rule (the language preserves `A | A` per Issue 4). The cleanest answer is "leave the spelling alone; if the user wants collapse they can write the branches without the `if`".
+- **`_ConditionalContent` source compatibility.** SwiftUI ships `_ConditionalContent` as part of its public ABI for backwards compatibility. Migrating SwiftUI itself to narrowed-`Any` would be an ABI-additive change (SwiftUI's `View` body is `some View`, so the concrete type is opaque to callers); whether SwiftUI does the migration is a separate library-level decision, but it is *unblocked* by narrowed-`Any` shipping.
+- **Pre-narrowed-`Any` builders.** Existing builders using `_ConditionalContent`-style wrappers continue to work unchanged — narrowed-`Any` doesn't deprecate them. New builders or new versions can adopt narrowed-`Any` whenever they want.
+
+The language change is already done by v1; this is purely a library-evolution follow-up, and a particularly visible one because SwiftUI is one of Swift's most-used result builders. v1 leaves this open as a library-side opportunity rather than committing the SwiftUI team to specific timing.
+
 ### Tagged-union layout for small POD leaf sets (and the Embedded Swift story)
 
 When every leaf is small and POD (`Bool | UInt8`, `Int8 | Int16`), the existential layout is wasteful — a 24-byte inline buffer plus a metadata pointer for what could fit in two bytes. An IRGen pass could lay out such narrowed-`Any` values as `discriminator + payload` locally, the way `Optional<Int>` packs into a spare-bit representation today. Cross-module ABI continues to use the existential layout; the optimisation is local-only.
