@@ -42,7 +42,7 @@ The "type-only unions" line of pitches has been rejected enough times that revie
 | --- | --- |
 | "Swift philosophy doesn't favour structural types." | This is *not* structural. The conformer set is nominal and closed: `A \| B` enumerates the two leaf types by name. The visible interface is the **join**, exposed nominally; no methods are synthesised by structural intersection. See § [The join](#the-join-what-members-are-visible). |
 | "Type-only unions have been rejected multiple times." | The rejected designs were either implicitly converting (TypeScript-flavoured) or magic-dispatching (anonymous enums with auto-`.case` synthesis). This proposal does *neither*: leaf injection is the only implicit move, narrowing requires `as?` / `as!`. See § [Cross-shape conversion](#cross-shape-conversion). |
-| "It adds a new kind of type." | It does not. `A \| B` is `Any` plus a closed conformer table — same existential machinery already shipped for [SE-0309][SE-0309] (`any P`) and [SE-0353][SE-0353] (parameterised existentials). No new metadata kind, no new layout, no new ABI category. See § [Runtime representation](#runtime-representation) and § [ABI compatibility](#abi-compatibility). |
+| "It adds a new kind of type." | At the type-system level `A \| B` is a first-class type with its own identity (mangling, witness selection, extension target), and at the runtime level it reuses Swift's existing existential machinery — same `Any`-singleton metadata + `swift_dynamicCast` already shipped for [SE-0309][SE-0309] (`any P`) and [SE-0353][SE-0353] (parameterised existentials). No new metadata kind, no new layout, no new ABI category. See § [Runtime representation](#runtime-representation) and § [ABI compatibility](#abi-compatibility). |
 | "Wrapper enums are good enough for typed throws." | True for a single library. Across libraries the wrapper enums don't compose: combining `enum E1 { case a, b }` and `enum E2 { case c, d }` requires a third hand-written `enum E3` that re-cases everything (quadratic). `A \| B \| C` composes linearly. See § [`O(N×M)` → `O(N+M)`](#onm--onm). |
 | "TypeScript-style unions cause problems in practice (e.g. erasure)." | This is not TypeScript's union. TS unions are structural and lose nominal identity (`{ kind: "a" } \| { kind: "b" }` is a discriminated record); ours are nominal and over a closed class of conformers. There is no `typeof` narrowing, no implicit subtype upcast across shapes. See § [TypeScript-style structural unions](#typescript-style-structural-unions) for the contrast. |
 | "What about ergonomics on the wrapper enum side?" | Conformance synthesis mirrors what wrapper enums already get: untagged `Codable`, exhaustive `switch`, a join-based interface for shared methods. No fewer features than enums, and one extra spelling. See § [Conformance synthesis](#conformance-synthesis-v1-scope). |
@@ -213,6 +213,8 @@ The *join* of a narrowed-`Any` is the smallest common base type — the **least 
 * The **conformance** of `A | B` to a protocol `P` holds iff `A: P` and `B: P`.
 * `A | B` is a subtype of any non-narrowed `T` such that both `A: T` and `B: T`.
 * `A` and `B` are each subtypes of `A | B`.
+
+These join-derived members and conformances are the **only** source of behaviour for `A | B` in v1, because v1 rejects user-written extensions on a narrowed-`Any` target (see [Conformance synthesis (v1 scope)](#conformance-synthesis-v1-scope)). The follow-up [§ Extending a narrowed-`Any` directly](#extending-a-narrowed-any-directly) lifts that restriction; in that follow-up the join-derived behaviour acts as a *fallback* — user-declared methods or conformances on `A | B` itself take priority, the way concrete-type witnesses already shadow protocol-extension default implementations in Swift today.
 
 ```swift
 extension Int:    CustomStringConvertible { ... }
@@ -546,7 +548,7 @@ So existing v1-era `as!` adoption code automatically rots into actionable warnin
 
 **Why route 1 (per-witness dispatch) is the design we commit to**, even though v1 ships without the synthesis: the alternative — auto-erasing `A | B` into `any P` whenever every leaf conforms to `P` — would lose [Spelling is identity](#spelling-is-identity) at the protocol-dispatch level, because two values with different spellings would observably behave the same once erased. v1 leaves the synthesis door open so the conformance can land later without changing the user-visible model.
 
-**User-defined conformances on `A | B` are deferred to a follow-up.** v1 ships only the *synthesised* conformances above; user-written `extension Int | String: P { ... }` for any protocol `P` is rejected with a tailored diagnostic that points users at the v1 workarounds (extend each leaf type individually, or write a generic function with `where T: A | B`). The planned exception is `extension Int | String: Codable { ... }` for libraries with bespoke wire formats (OpenAPI discriminator, custom try-order beyond declaration order); that follow-up shares the same compiler work — extending the mangler / Sema to accept narrowed-`Any` as an extension target — with the more general user-written `extension Int | String { func ... }` form (see [Future directions § Extending a narrowed-`Any` directly](#extending-a-narrowed-any-directly) and [§ Codable user override](#codable-user-override)). The v1 rejection is *not* a permanent design choice; it is the conservative starting point that defers the mangling work to a focused follow-up.
+**User-defined extensions on `A | B` are deferred to a follow-up.** v1 ships only the synthesised conformances above; user-written `extension Int | String { func ... }` and `extension Int | String: P { ... }` are rejected with a tailored diagnostic that points users at the v1 workarounds (extend each leaf type individually, or write a generic function with `where T: A | B`). When the follow-up lands, `Int | String` is treated as a first-class extension target — methods and conformances declared on it directly **take priority over the synthesised behaviour** above, the way a concrete type's own witness already shadows a protocol-extension default in Swift today. So `extension Int | String: Codable { ... }` for libraries with bespoke wire formats (OpenAPI discriminator, custom try-order beyond declaration order) is the user-override hook for the v1 untagged-Codable synthesis, not a re-declaration of an existing conformance: the v1 synthesis is an *implicit fallback*, not a *declared* conformance, so Swift's "no duplicate conformance" rule does not fire. See [Future directions § Extending a narrowed-`Any` directly](#extending-a-narrowed-any-directly) and [§ Codable user override](#codable-user-override). The v1 rejection is *not* a permanent design choice; it is the conservative starting point that defers the mangling work to a focused follow-up.
 
 #### Cast safety
 
@@ -761,7 +763,7 @@ JSONDecoder().decode(V.self, from: jsonData)    // succeeds on either an integer
 
 For overlapping pairs (`URL | String`, `Int | Double`) declaration order is the user's controlled lever — `Int | Double` decodes a JSON number as `Int` first, `Double | Int` decodes the same number as `Double`. § [Spelling is identity](#spelling-is-identity) is what makes the order well-defined.
 
-The decoder path is implemented in the prototype, with untagged round-trip across nested narrowed-`Any`, `Codable` containers, and arrays of narrowed-`Any` (see § [Implementation status](#implementation-status) for the full prototype matrix). **User-extension override** — `extension Int | String: Codable { ... }` for libraries that want a custom encoder/decoder pair (tagged on the wire, OpenAPI discriminator, custom try-order beyond declaration order) — is deferred to a follow-up; v1 rejects all extension forms on a narrowed-`Any` target. See [Future directions § Codable user override](#codable-user-override) for the design and the implementation gating (extending the mangler / Sema to accept narrowed-`Any` as an extension target).
+The decoder path is implemented in the prototype, with untagged round-trip across nested narrowed-`Any`, `Codable` containers, and arrays of narrowed-`Any` (see § [Implementation status](#implementation-status) for the full prototype matrix). The v1 untagged synthesis acts as a **fallback** that fires when no user-declared extension provides Codable on the narrowed-`Any` (see [§ Extending a narrowed-`Any` directly](#ext-rule-fallback) for the priority rule). **User-extension override** — `extension Int | String: Codable { ... }` for libraries that want a custom encoder/decoder pair (tagged on the wire, OpenAPI discriminator, custom try-order beyond declaration order) — is deferred to a follow-up; v1 rejects all extension forms on a narrowed-`Any` target, so in v1 the synthesis fallback is the only path. See [Future directions § Codable user override](#codable-user-override) for the design and the implementation gating (extending the mangler / Sema to accept narrowed-`Any` as an extension target).
 
 ### Issue 6: Generic constraints `where T: A | B`
 
@@ -959,7 +961,7 @@ The layout transformation is a local IRGen pass — no ABI changes, no new metad
 
 Today `extension Int | String { … }` is rejected with a tailored "non-nominal type" diagnostic that points users at two workarounds: extend each leaf type individually (`extension Int { … }; extension String { … }`), or add behaviour uniformly across leaves through a generic function with `where T: A | B`. This is the conservative v1 starting point; it is **not** a permanent design choice.
 
-A follow-up lifts the restriction in two related directions, both gated on the same compiler work (extending the mangler / Sema to accept narrowed-`Any` as an extension target):
+A follow-up lifts the restriction by **treating `Int | String` as a first-class extension target** — both for adding methods and for declaring protocol conformances, gated on the same compiler work (extending the mangler / Sema to accept narrowed-`Any` as an extension target):
 
 ```swift
 // Form 1 — adding a method directly to the narrowed-Any.
@@ -973,14 +975,23 @@ extension Int | String {
 }
 
 // Form 2 — declaring a user-supplied protocol conformance, the canonical
-// motivator from Issue 5 (see § Codable user override).
+// motivator from Issue 5 (see § Codable user override). Takes priority over
+// the v1 untagged-Codable synthesis fallback.
 extension Int | String: Codable {
     func encode(to encoder: Encoder) throws { ... }
     init(from decoder: Decoder) throws { ... }
 }
 ```
 
-Form 1 is the general "method-adding" surface; the body can dispatch per-leaf with `switch self` whose exhaustiveness over the closed leaf set is statically verifiable (strictly more amenable to type-checking than the corresponding `extension any P { … }` for an open-existential, which is also rejected in current Swift). Form 2 is § [Codable user override](#codable-user-override) — the originally-motivating use case from [Issue 5](#issue-5-codable-round-trips), allowing libraries to ship custom Codable wire formats without a hand-rolled wrapper enum. The two forms share implementation: once narrowed-`Any` is accepted as an extension target, both shapes parse and type-check through the same path; the only extra piece for Form 2 is wiring the conformance through `lookupConformance` so it shadows the synthesised default.
+Two design rules anchor the follow-up:
+
+<a id="ext-rule-namespace"></a>
+**Methods belong to `Int | String`, not to its leaves.** A method declared in `extension Int | String { … }` is callable when the *static* receiver type is `Int | String` (or a recursive container that exposes the alternation, like `[Int | String]`). It is **not** callable on a leaf-typed receiver — `let n: Int = 7; n.describe()` does not resolve to the narrowed-`Any` extension, the same way a method on `Int` does not resolve through `String`. Leaf-typed receivers reach the extension by explicit lift: `(7 as Int | String).describe()`. This is consistent with Swift's existing extension-dispatch rule (lookup follows the receiver's static type) and avoids overload conflicts with leaf-side extensions like `extension Int { func describe() }`. Implicit leaf injection still applies at the *value* and *element* positions per § [Implicit conversion](#implicit-conversion); only the *receiver-of-method-dispatch* position is exempt.
+
+<a id="ext-rule-fallback"></a>
+**User-declared extensions take priority over the v1 synthesis fallback.** The auto-synthesised conformances from § [Conformance synthesis (v1 scope)](#conformance-synthesis-v1-scope) (untagged Codable, marker / self-conforming protocols, eventual per-witness dispatch) act as *implicit fallback witnesses* that fire when no user-declared extension provides the conformance. A user-written `extension Int | String: Codable { ... }` is the explicit declaration; the synthesis steps aside. There is no "duplicate conformance" conflict because the v1 synthesis is a fallback rule, not a declared conformance — same shape as how a concrete type's own witness already shadows a protocol-extension default implementation in Swift today.
+
+Form 1 is the general "method-adding" surface; the body can dispatch per-leaf with `switch self` whose exhaustiveness over the closed leaf set is statically verifiable (strictly more amenable to type-checking than the corresponding `extension any P { … }` for an open-existential, which is also rejected in current Swift). Form 2 is § [Codable user override](#codable-user-override) — the originally-motivating use case from [Issue 5](#issue-5-codable-round-trips), allowing libraries to ship custom Codable wire formats without a hand-rolled wrapper enum. The two forms parse and type-check through the same path; the only extra piece for Form 2 is wiring the user-declared conformance through `lookupConformance` so it shadows the synthesis fallback at conformance lookup time.
 
 ### Parameter packs collapsed into a narrowed-`Any`
 
@@ -988,7 +999,7 @@ Form 1 is the general "method-adding" surface; the body can dispatch per-leaf wi
 
 ### Codable user override
 
-Issue 5 in v1 ships untagged-only Codable. A follow-up should provide a user-extension hook for libraries that want a custom encoder/decoder pair — typically because their wire format expects a discriminator (OpenAPI's `oneOf`, serde-style tagged union) or a specific overlap-handling order beyond declaration order. The intended syntactic form is the natural one — a Codable conformance written as an extension on the narrowed-`Any`:
+Issue 5 in v1 ships untagged-only Codable as a *synthesis fallback*. A follow-up should provide a user-extension hook for libraries that want a custom encoder/decoder pair — typically because their wire format expects a discriminator (OpenAPI's `oneOf`, serde-style tagged union) or a specific overlap-handling order beyond declaration order. The intended syntactic form is the natural one — a Codable conformance written as an extension on the narrowed-`Any`, taking priority over the v1 synthesis fallback per the rule in [§ Extending a narrowed-`Any` directly](#ext-rule-fallback):
 
 ```swift
 extension Int | String: Codable {
