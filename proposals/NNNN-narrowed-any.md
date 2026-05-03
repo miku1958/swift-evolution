@@ -138,7 +138,7 @@ do {
   catch .third(let e)  { ... }
 ```
 
-Same content, different mechanical wrapper. Now both the API author and the caller know the discriminator names `.first` / `.second` / `.third` are arbitrary positional indices that drift the moment someone adds a new error type. Not exhaustive across libraries (`OneOf3` and `OneOf4` are unrelated types).
+Same content, different mechanical wrapper. The discriminator names `.first` / `.second` / `.third` are arbitrary positional indices that drift the moment someone adds a new error type — adding a fourth source of failure forces a switch from `OneOf3` to `OneOf4`, which is a different (unrelated) type with its own discriminator names, so every existing call site has to be rewritten. Composing across libraries inherits the same friction: two libraries that each expose a `OneOf3<…>` over different leaf sets cannot be merged without a hand-rolled wrapper that re-cases both sides.
 
 **(4) Narrowed `Any` (this proposal).** No discriminator, no wrapper, exhaustive switch, composable across libraries:
 
@@ -220,23 +220,25 @@ extension String: CustomStringConvertible { ... }
 
 let v: Int | String = "hi"
 
-// Generic-position dispatch through the join — works:
+// Direct join-member access — `description` is a CustomStringConvertible member
+// and both Int and String conform, so it is in the join and dispatches through
+// the synthesised witness:
+print(v.description)                 // OK: dispatches via the join's CustomStringConvertible witness
+print("v=\(v)")                      // OK: string interpolation goes through the same witness
+
+// Generic-position dispatch with the same join protocol — works the same way:
 func describe<T: CustomStringConvertible>(_ x: T) { print(x) }
-describe(v)                          // OK: v conforms to CustomStringConvertible
-print("v=\(v)")                      // OK: string interpolation goes through the
-                                     //     CustomStringConvertible witness
+describe(v)                          // OK: Int | String conforms to CustomStringConvertible via the join
 
-// Direct instance-side member access — rejected with a tailored
-// diagnostic ("member cannot be used on value of type 'V'; consider
-// using a generic constraint instead"). To use a leaf-specific
-// method, narrow first with `as?`:
-// v.description                     // error
+// Leaf-only methods — rejected at compile time, because they are not in the
+// join. To use a leaf-specific method, narrow first with `as?`:
+// v.append("x")                     // error: 'append' is on String, not on every leaf
 if let s = v as? String { s.append("x") }   // OK after explicit narrow
-
-v.append("x")                        // error: append is leaf-only (String)
 ```
 
-This makes narrowed `Any` **strictly more useful than open `Any`** — it carries the witnesses for whatever `A` and `B` share, reachable through generic-position dispatch — but **strictly less surprising than TypeScript-style structural unions** — direct instance-side member access on the existential is rejected, and leaf-only methods are never magically synthesised.
+This makes narrowed `Any` **strictly more useful than open `Any`** — it carries the witnesses for whatever `A` and `B` share, callable directly through the join's witness tables — but **strictly less surprising than TypeScript-style structural unions** — leaf-only methods (those not in the join) are rejected at compile time rather than dispatched dynamically.
+
+**v1 prototype status.** The example above shows the *design* — per-witness dispatch through the join is the commitment described in [§ Conformance synthesis (v1 scope)](#conformance-synthesis-v1-scope), and the v1 review surface is that design. The current prototype ships only the self-conforming-protocol synthesis (`Error`, marker protocols); for protocols with method requirements (`Hashable`, `Equatable`, `Comparable`, `CustomStringConvertible`) the synthesis is **deferred from v1** with an explicit `as! any P` escape hatch — see [§ Conformance synthesis (v1 scope)](#conformance-synthesis-v1-scope) for the rationale and [Future directions § Per-narrowed-Any witness emission](#per-narrowed-any-witness-emission) for the follow-up that completes the example as shown.
 
 The join is computed lazily on first access and cached as a field on `TypeBase`. First access walks each leaf's protocol-conformance list and class-hierarchy chain, intersecting and finding the LCA; subsequent access is `O(1)`. The constituent lookups (`Module::lookupConformance`, `ClassDecl::getSuperclassDecl`) are themselves already memoised by Swift's `TypeChecker` / `ASTContext`, so even cold-start is bounded by a handful of hash queries.
 
@@ -358,13 +360,17 @@ Generic containers do *not* covary in their element type:
 
 ### Implicit conversion
 
-The **only** implicit conversion in this proposal is leaf-introduction: a value of a leaf type may be assigned to a narrowed-`Any` declaration that lists that type as one of its alternatives, anywhere in the recursive expansion:
+The **only** implicit conversion in this proposal is **leaf-introduction**, in two positions: at the value level a leaf-typed value may be assigned to a narrowed-`Any` declaration that lists that leaf as one of its alternatives, and at the container/extension-dispatch level a leaf-typed receiver lifts the same way to a narrowed-`Any` element slot (per-element leaf injection — see [Subtyping lattice](#subtyping-lattice) and [Containers and extensions](#containers-and-extensions)). Both positions are the same lift; the second is the natural extension of the first to the container axis.
 
 ```swift
 let p: Int = 7
-let q: Int | String          = p   // implicit
+let q: Int | String          = p   // implicit (value level)
 let r: String | Int          = p   // implicit (still introducing the leaf Int)
 let s: (Int | Double) | Bool = p   // implicit (Int appears recursively)
+
+extension Array where Element == Int | String { func summary() -> String { ... } }
+let xs: [Int] = [1, 2, 3]
+xs.summary()                       // implicit (per-element leaf injection — every Int element fits the Int | String slot)
 ```
 
 Every other narrowed-`Any` ↔ narrowed-`Any` conversion **requires explicit `as` / `as?` / `as!`**, even when the relationship is provably safe — see [Spelling is identity](#spelling-is-identity).
@@ -566,16 +572,16 @@ func process<T: NetworkError | DecodingError>(_ error: T) {
     }
 }
 
-// Caller can pass either leaf:
-process(NetworkError.timeout)        // T = NetworkError
-process(DecodingError.malformed)     // T = DecodingError
-
-// Or a value whose static type is the alternation itself:
+// All three call sites are accepted by the constraint:
+process(NetworkError.timeout)         // leaf value
+process(DecodingError.malformed)      // leaf value (different leaf)
 let e: NetworkError | DecodingError = ...
-process(e)                            // T = NetworkError | DecodingError
+process(e)                            // alternation value
 ```
 
 The body type-checks against the *join* of the constraint's leaves — the body of `process` may use any member that every leaf provides, but cannot use leaf-only members without first narrowing with `as?`. This matches what the body of a function taking `A | B` directly already sees.
+
+**v1 binding rule.** v1 lowers `where T: A | B` to the same-type degraded form `where T == A | B`, so inside the body `T` is always bound to the alternation type itself, regardless of which leaf the caller passed; leaf-typed call sites work via implicit leaf-injection at the call boundary. Full set-membership specialisation — letting the body see `T` as the bound leaf when the substitution is one — is sketched as [Future directions § True set-membership for `where T: A | B`](#true-set-membership-for-where-t-a--b) and shares a constraint-solver hook with the order-insensitive-marker future direction. The order-freeness rule above ("`where T: A | B` and `where T: B | A` accept the same set of substitutions") and the `switch` over `error` shown in the body are unaffected by the v1 lowering.
 
 **One narrowed-`Any` constraint per type parameter.** Multiple narrowed-`Any` clauses (`where T: A | B, T: C | D`) and the three `&`-with-narrowed-`Any` interactions (`(A | B) & P`, `(A | B) & SomeClass`, `(A | B) & (C | D)`) are **all rejected** with a diagnostic. Reasons and fix-it details are spelled out in § [Issue 6](#issue-6-generic-constraints-where-t-a--b) and § [Issue 9](#issue-9-interaction-with--protocol-composition--superclass).
 
@@ -605,7 +611,7 @@ The runtime thrown value is always *one concrete leaf* — both leaves of `doAno
 - `throws(Never | A)`: same inhabited subset after stripping the `Never` leaf; same call-site behaviour.
 - `throws(Never | Never)`: inhabited subset empty → non-throwing at the call site, the natural multi-leaf extension of [SE-0413]'s existing `throws(Never)` rule. Calling such a function does not require `try`.
 - `switch v` over `v: A | Never`: no `case _ as Never:` arm required for exhaustiveness — that leaf is unreachable, so omitting it is not a "missing case" diagnostic.
-- `Codable` for `A | Never`: encode skips the `Never` leaf in the try-order (no value can match); decode skips it in the try-order (it would always fail). Operationally identical to `A`'s `Codable`.
+- `Codable` for `A | Never`: encode never sees a `Never` value (the dynamic type can never be uninhabited, so the type-directed dispatcher never reaches that arm); decode skips the `Never` leaf in the declaration-order try sequence (constructing a `Never` value would always fail). Operationally identical to `A`'s `Codable`.
 
 **Type identity is *not* affected.** `A | Never` and `A` have different mangled names, different signatures, different witness-table identities — [Spelling is identity](#spelling-is-identity) is preserved at the ABI / Codable declaration order / witness-selection level. The inhabited-subset rule applies only to *call-site reachability decisions*, not to type identity itself. This is the same posture SE-0413 already takes for `throws(Never)`: the function's static type still mentions `Never`, but the call-site `try` requirement is computed from "is the throws set effectively empty?".
 
@@ -1063,7 +1069,7 @@ Two takeaways for reviewers:
 
 ## Acknowledgements
 
-This proposal absorbs ideas from Lincoln Wu, Wade Tregaskis, Michel Fortin, John McCall, Jordan Rose, Slava Pestov, Tino, ksluder, and the Scala 3 / Ceylon design teams. The Codable design is a direct codification of the [2018 forum recommendation][itai-2018] by Itai Ferber (co-author of [SE-0166][SE-0166]). Disagreements are mine.
+This proposal absorbs ideas from Wade Tregaskis, Michel Fortin, John McCall, Jordan Rose, Slava Pestov, Tino, and the Scala 3 / Ceylon design teams. The Codable design is a direct codification of the [2018 forum recommendation][itai-2018] by Itai Ferber (co-author of [SE-0166][SE-0166]). Disagreements are mine.
 
 [SE-0166]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0166-swift-archival-serialization.md
 [SE-0309]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0309-unlock-existential-types-for-all-protocols.md
