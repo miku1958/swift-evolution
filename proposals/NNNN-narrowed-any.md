@@ -358,22 +358,20 @@ The "not itself a narrowed-`Any`" carve-out matters: implicit conversion from on
 Generic containers do *not* covary in their element type:
 
 * `Array<A | B>` is *not* a subtype of `Array<A>`. `Array` is invariant; changing the element type changes the mangled name.
-* Extension dispatch on a generic with a narrowed-`Any` element constraint takes part in **per-element leaf injection**, the natural lift of value-level leaf injection to the container axis: `extension Array where Element == Int | String { … }` matches receivers of type `[Int | String]` (exact spelling), `[Int]`, and `[String]` — every concrete leaf type fits implicitly, just as `let v: Int | String = 7` accepts an `Int` value implicitly. Without this lift the extension form has no value over writing one extension per leaf. *Cross-spelling* receivers (`[String | Int]` matching the same extension) still need an explicit `as` cast in v1, consistent with [Spelling is identity](#spelling-is-identity); the [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses) future direction relaxes that. § [Containers and extensions](#containers-and-extensions) covers both axes.
+* Extension dispatch on a generic with a narrowed-`Any` element constraint applies to receivers whose generic argument matches the constraint exactly: `extension Array where Element == Int | String { … }` matches `[Int | String]`. Leaf-typed receivers (`[Int]`, `[String]`) and cross-spelling receivers (`[String | Int]`) need an **explicit cast** in v1 — the compiler emits a fix-it that inserts `(receiver as [A | B])` for the leaf case and `(receiver as [A | B])` for the cross-spelling case (one keystroke each). The implicit lift — accepting a leaf-typed receiver without a cast — is a deferred follow-up; the v1 ergonomic story is "fix-it makes the cast trivial". See [Per-element leaf injection at the extension boundary](#per-element-leaf-injection-at-the-extension-boundary) for why the implicit form is harder than it looks (per-element layout differs between `[Int]` and `[Int | String]`, requiring a runtime element-wrap conversion). § [Containers and extensions](#containers-and-extensions) covers all three axes.
 
 ### Implicit conversion
 
-The **only** implicit conversion in this proposal is **leaf-introduction**, in two positions: at the value level a leaf-typed value may be assigned to a narrowed-`Any` declaration that lists that leaf as one of its alternatives, and at the container/extension-dispatch level a leaf-typed receiver lifts the same way to a narrowed-`Any` element slot (per-element leaf injection — see [Subtyping lattice](#subtyping-lattice) and [Containers and extensions](#containers-and-extensions)). Both positions are the same lift; the second is the natural extension of the first to the container axis.
+The **only** implicit conversion in this proposal is **leaf-introduction at the value level**: a leaf-typed value may be assigned to a narrowed-`Any` declaration that lists that leaf as one of its alternatives.
 
 ```swift
 let p: Int = 7
 let q: Int | String          = p   // implicit (value level)
 let r: String | Int          = p   // implicit (still introducing the leaf Int)
 let s: (Int | Double) | Bool = p   // implicit (Int appears recursively)
-
-extension Array where Element == Int | String { func summary() -> String { ... } }
-let xs: [Int] = [1, 2, 3]
-xs.summary()                       // implicit (per-element leaf injection — every Int element fits the Int | String slot)
 ```
+
+The container-axis analogue — a leaf-typed `[Int]` reaching `extension Array where Element == Int | String` without writing an `as` cast — is a natural extension of this rule, but ships in v1 as **explicit-cast-with-fix-it** rather than implicit, because the per-element runtime layout of `[Int]` and `[Int | String]` differs (8-byte raw `Int` slots vs. 24-byte `Any`-singleton existential slots) and the conversion requires a per-element wrapping pass. See [Containers and extensions](#containers-and-extensions) for the v1 ergonomics and [Per-element leaf injection at the extension boundary](#per-element-leaf-injection-at-the-extension-boundary) for the deferred implicit form.
 
 Every other narrowed-`Any` ↔ narrowed-`Any` conversion **requires explicit `as` / `as?` / `as!`**, even when the relationship is provably safe — see [Spelling is identity](#spelling-is-identity).
 
@@ -484,7 +482,7 @@ The runtime cost is one metadata-pointer comparison plus the rebox — roughly t
 
 ### Containers and extensions
 
-`Array<A | B>` is *not* a subtype of `Array<A>` (Array is invariant). Extension dispatch on a generic constrained by `where Element == narrowed-Any` participates in **per-element leaf injection**: a leaf-typed array (`[A]` or `[B]`) matches an extension on `[A | B]` implicitly, the same way value-level leaf injection lets `let v: A | B = leafValue` work without an explicit cast. *Cross-spelling* receivers (a `[B | A]` array reaching an extension on `[A | B]`) still need an explicit `as` cast in v1, consistent with [Spelling is identity](#spelling-is-identity).
+`Array<A | B>` is *not* a subtype of `Array<A>` (Array is invariant). Extension dispatch on a generic constrained by `where Element == narrowed-Any` matches receivers whose generic argument is exactly that narrowed-`Any` spelling. Leaf-typed and cross-spelling receivers need an **explicit cast** in v1, both with a one-keystroke fix-it.
 
 ```swift
 extension Array where Element == String | Int {
@@ -496,12 +494,12 @@ let zs:  [Int | String] = [1, "a"]                 // same leaves, different spe
 let xs:  [String]       = ["a", "b"]               // single leaf, narrowed-`Any` is wider
 
 ys.summary()                                       // OK: same spelling
-xs.summary()                                       // OK: per-element leaf injection — every
-                                                   //     `String` element fits an `Int | String`
-                                                   //     element slot implicitly, so `[String]`
-                                                   //     fits `[Int | String]` element-wise.
-zs.summary()                                       // error: cross-spelling — reshape with `as`
-(zs as [String | Int]).summary()                   // OK: explicit reshape
+
+xs.summary()                                       // error: leaf-typed receiver — fix-it: ` as [String | Int]`
+(xs as [String | Int]).summary()                   // OK: explicit lift, walks elements wrapping each as Any-singleton
+
+zs.summary()                                       // error: cross-spelling — fix-it: ` as [String | Int]`
+(zs as [String | Int]).summary()                   // OK: explicit reshape (runtime-free relabel)
 
 extension Array where Element == String {
     func leafOnly() -> String { ... }
@@ -513,13 +511,13 @@ ys.leafOnly()                                      // error: `[String | Int]` is
                                                    //     element is Int
 ```
 
-The two axes of dispatch:
+The three axes of dispatch:
 
-* **Leaf injection (implicit)** — `[A]` matches an extension on `[A | B]`. The whole point of writing the extension this way: behaviour declared for `[Int | String]` should naturally apply to a homogeneous `[Int]` or `[String]` too, because every leaf-typed element fits the wider element slot for free. Without this lift the extension form duplicates what one-extension-per-leaf already provides, and the user is left manually casting every leaf-typed array to access the wider extension's behaviour.
+* **Leaf injection (explicit in v1, with fix-it)** — `[A]` reaching an extension on `[A | B]` needs `as [A | B]`. The cast is *not* runtime-free: `[Int]`'s element layout (8-byte raw `Int` slots) differs from `[Int | String]`'s (24-byte `Any`-singleton existential slots — same shape as a value-level `let v: Int | String = 7`), so the cast walks the array wrapping each element as an `Any`-singleton existential. The fix-it makes the cast a one-keystroke fix; the *implicit* form is a deferred follow-up — see [Per-element leaf injection at the extension boundary](#per-element-leaf-injection-at-the-extension-boundary) for the design and the implementation cost.
 * **Narrowed → leaf (explicit, partial)** — `[A | B]` reaching an extension on `[A]` needs `as? [A]` because the runtime might hold a `B` element. This is the dual direction; same shape as Swift's current `[Animal] as? [Dog]`.
-* **Cross-spelling (explicit, total)** — `[B | A]` reaching an extension on `[A | B]` needs `as [A | B]` to reshape the spelling. Runtime-free relabel (both arrays have bit-identical memory layout — each element is narrowed-`Any` using the `Any`-singleton metadata regardless of leaf order); only the type identity flips. Per [Spelling is identity](#spelling-is-identity), Codable encoding order, witness selection, and mangling all follow the new spelling.
+* **Cross-spelling (explicit, total, runtime-free)** — `[B | A]` reaching an extension on `[A | B]` needs `as [A | B]` to reshape the spelling. Both arrays have bit-identical memory layout (each element is narrowed-`Any` using the `Any`-singleton metadata regardless of leaf order), so the cast is a SIL-level type relabel — no element walk, no buffer reallocation. Per [Spelling is identity](#spelling-is-identity), Codable encoding order, witness selection, and mangling all follow the new spelling. The cross-spelling axis can be relaxed by the [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses) future direction.
 
-The cross-spelling axis can be relaxed via the [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses) future direction (`where Element ~= Int | String` would let one extension cover any spelling whose sorted leaves agree). The leaf-injection axis is not optional — it ships with v1.
+In short: cross-spelling is a free relabel; leaf injection is an O(N) wrap; both are explicit-with-fix-it in v1.
 
 ### Conformance synthesis (v1 scope)
 
@@ -824,7 +822,7 @@ Working today:
 
 Known v1 gaps (must land before review or planned for first follow-up):
 
-- **Per-element leaf injection at the extension boundary**: the proposal commits to letting `[Int]` and `[String]` match an extension declared on `Array where Element == Int | String` via per-element leaf injection (see § [Containers and extensions](#containers-and-extensions)). The current prototype rejects the lift; today users have to write `(xs as [Int | String]).method()` to access the extension. This must close before review — without it the `where Element == A | B` extension form provides no value over writing one extension per leaf, and the proposed value-vs-container leaf-injection symmetry breaks. Cross-spelling reshape via explicit `as` is verified working end-to-end (test bed `phase2_edge.swift §8`); only the implicit lift is missing.
+- **Per-element leaf injection fix-it at the extension boundary**: when a leaf-typed receiver (`xs: [Int]`) reaches an extension on a narrowed-`Any` element (`extension Array where Element == Int | String`), v1 emits the existing same-type-requirement error with a fix-it that inserts `(receiver as [Int | String])` before the call. The fix-it makes the cast one keystroke; users see "error → click → fixed". The *implicit* form (no cast at all) is deferred to a follow-up — see [Future directions § Per-element leaf injection at the extension boundary](#per-element-leaf-injection-at-the-extension-boundary). The fix-it itself is the v1 must-close-before-review item. Explicit-cast (`(xs as [Int | String]).method()`) is verified working end-to-end (test bed `phase2_edge.swift §8`); the SIL path for the cast itself is mature.
 - **Per-witness dispatch** (`Hashable`, `Equatable`, `Comparable`, `CustomStringConvertible`, etc.): synth path today is gated on `isMarkerProtocol() || requiresSelfConformanceWitnessTable()`. v1 escape hatch: explicit `as! any P` (works, `phase2f-runtime.swift §8a` validates). See [Future directions § Per-narrowed-Any witness emission](#per-narrowed-any-witness-emission) for the design.
 - **swift-syntax sync**: companion fork at [miku1958/swift-syntax][fork-syntax], branch [`narrowed-any/syntax-sync`][fork-syntax-branch] (commit [`2973425f`][fork-syntax-commit]). Adds 3 syntax nodes — mechanical schema change + parser loop — to teach `swift-syntax` to recognise `A | B` natively. The branch is published but not yet upstreamed; the ABI / API surface is small and review-ready, but it ships in lockstep with the language change so the upstream PR will land alongside the swift-evolution proposal acceptance.
 
@@ -895,6 +893,20 @@ struct S: P {
 ```
 
 The relaxation is strictly more permissive than v1's rule, so adopting it later does not break existing code. It does require Sema to compute leaf-set inclusion at the witness boundary and IRGen to emit a parameter-narrowing / return-widening thunk. Same shape as throws variance under [SE-0413]'s chosen rule.
+
+### Per-element leaf injection at the extension boundary
+
+v1 ships extension dispatch on `Array where Element == A | B` as **explicit-cast-with-fix-it**: a leaf-typed receiver (`xs: [Int]` reaching `extension Array where Element == Int | String`) is rejected with a fix-it that inserts `(receiver as [Int | String])`. The cast walks the array element-wise, wrapping each leaf as an `Any`-singleton existential, because `[Int]` (8-byte raw `Int` slots) and `[Int | String]` (24-byte `Any`-singleton slots) have different per-element layouts — the conversion cannot be a runtime-free relabel.
+
+A follow-up could relax the cast to be **implicit**: the compiler synthesises the same per-element wrap automatically at the call site, so the user writes `xs.summary()` rather than `(xs as [Int | String]).summary()`. The two forms are operationally identical at runtime (same wrap pass); only the source-level ergonomics differ.
+
+The implementation cost is the reason this is deferred. It is **not** a small Sema patch — naively accepting the call at constraint-solver level produces an inconsistent substitution map (`Element -> Int` against the requirement `Element == Int | String`) that the SIL verifier rejects in a way that crashes SILGen. The proper path requires:
+
+1. **Constraint-solver detection**: when a member call's looked-up extension has a `where Element == narrowed-Any` constraint and the base type's generic argument is a leaf of that narrowed-`Any`, recognise the leaf-injection situation as a candidate conversion.
+2. **AST coercion insertion in CSApply**: rather than binding `Element` to the leaf, bind it to the narrowed-`Any` and insert an implicit `CoerceExpr` wrapping the receiver expression — equivalent to rewriting `xs.summary()` into `(xs as [Int | String]).summary()` before SILGen sees it.
+3. **No runtime change**: SILGen already lowers explicit `as [narrowed-Any]` correctly via per-element wrap; the synthesised implicit form lowers through the same path.
+
+The work sits in CSApply (constraint-solution rewriting), not in `matchTypes`. Multi-day effort. The v1 fix-it is the stop-gap; the implicit form lands cleanly later without changing the user-visible model — same call, same runtime cost, fewer keystrokes.
 
 ### Order-insensitive marker in `where` clauses
 
