@@ -538,6 +538,8 @@ So existing v1-era `as!` adoption code automatically rots into actionable warnin
 
 **Why route 1 (per-witness dispatch) is the design we commit to**, even though v1 ships without the synthesis: the alternative — auto-erasing `A | B` into `any P` whenever every leaf conforms to `P` — would lose [Spelling is identity](#spelling-is-identity) at the protocol-dispatch level, because two values with different spellings would observably behave the same once erased. v1 leaves the synthesis door open so the conformance can land later without changing the user-visible model.
 
+**User-defined conformances on `A | B` are deferred to a follow-up.** v1 ships only the *synthesised* conformances above; user-written `extension Int | String: P { ... }` for any protocol `P` is rejected with a tailored diagnostic that points users at the v1 workarounds (extend each leaf type individually, or write a generic function with `where T: A | B`). The planned exception is `extension Int | String: Codable { ... }` for libraries with bespoke wire formats (OpenAPI discriminator, custom try-order beyond declaration order); that follow-up shares the same compiler work — extending the mangler / Sema to accept narrowed-`Any` as an extension target — with the more general user-written `extension Int | String { func ... }` form (see [Future directions § Extending a narrowed-`Any` directly](#extending-a-narrowed-any-directly) and [§ Codable user override](#codable-user-override)). The v1 rejection is *not* a permanent design choice; it is the conservative starting point that defers the mangling work to a focused follow-up.
+
 #### Cast safety
 
 The cast surface (`as?` / `as!` / `is` / `case let _ as T:`) gets two correctness layers on top of `swift_dynamicCast`. Statically, the compiler walks both source and target for `NarrowedAnyType` and applies the rules in [Cross-shape conversion](#cross-shape-conversion): disjoint = hard error in every form; same spelling = redundant-cast warning; subset with different spelling = "always succeeds; use `as`" warning on `as?` / `as!`. Dynamically, the runtime's `swift_dynamicCast` path is layered with a leaf-membership post-check that re-applies the closed-leaf-set predicate the `Any`-singleton layout would otherwise lose, so nested `(Int | String) | Bool` casts compare against concrete-leaf metadata rather than the nested narrowed-`Any`'s `Any`-singleton.
@@ -753,7 +755,7 @@ JSONDecoder().decode(V.self, from: jsonData)    // succeeds on either an integer
 
 For overlapping pairs (`URL | String`, `Int | Double`) declaration order is the user's controlled lever — `Int | Double` decodes a JSON number as `Int` first, `Double | Int` decodes the same number as `Double`. § [Spelling is identity](#spelling-is-identity) is what makes the order well-defined.
 
-The decoder path is implemented in the prototype, with untagged round-trip across nested narrowed-`Any`, `Codable` containers, and arrays of narrowed-`Any` (see § [Implementation status](#implementation-status) for the full prototype matrix). User-extension override (a custom encoder/decoder pair) is deferred — see [Future directions § Codable user override](#codable-user-override).
+The decoder path is implemented in the prototype, with untagged round-trip across nested narrowed-`Any`, `Codable` containers, and arrays of narrowed-`Any` (see § [Implementation status](#implementation-status) for the full prototype matrix). **User-extension override** — `extension Int | String: Codable { ... }` for libraries that want a custom encoder/decoder pair (tagged on the wire, OpenAPI discriminator, custom try-order beyond declaration order) — is deferred to a follow-up; v1 rejects all extension forms on a narrowed-`Any` target. See [Future directions § Codable user override](#codable-user-override) for the design and the implementation gating (extending the mangler / Sema to accept narrowed-`Any` as an extension target).
 
 ### Issue 6: Generic constraints `where T: A | B`
 
@@ -947,13 +949,49 @@ The layout transformation is a local IRGen pass — no ABI changes, no new metad
 
 `Mirror(reflecting:)` currently surfaces only the dynamic leaf via the standard existential machinery. A future reflection surface could expose the static leaf list — useful for diagnostics tooling and for macros that want to inspect a narrowed-`Any` shape they were given.
 
+### Extending a narrowed-`Any` directly
+
+Today `extension Int | String { … }` is rejected with a tailored "non-nominal type" diagnostic that points users at two workarounds: extend each leaf type individually (`extension Int { … }; extension String { … }`), or add behaviour uniformly across leaves through a generic function with `where T: A | B`. This is the conservative v1 starting point; it is **not** a permanent design choice.
+
+A follow-up lifts the restriction in two related directions, both gated on the same compiler work (extending the mangler / Sema to accept narrowed-`Any` as an extension target):
+
+```swift
+// Form 1 — adding a method directly to the narrowed-Any.
+extension Int | String {
+    func describe() -> String {
+        switch self {
+        case let n as Int:    return "int(\(n))"
+        case let s as String: return "str(\(s))"
+        }
+    }
+}
+
+// Form 2 — declaring a user-supplied protocol conformance, the canonical
+// motivator from Issue 5 (see § Codable user override).
+extension Int | String: Codable {
+    func encode(to encoder: Encoder) throws { ... }
+    init(from decoder: Decoder) throws { ... }
+}
+```
+
+Form 1 is the general "method-adding" surface; the body can dispatch per-leaf with `switch self` whose exhaustiveness over the closed leaf set is statically verifiable (strictly more amenable to type-checking than the corresponding `extension any P { … }` for an open-existential, which is also rejected in current Swift). Form 2 is § [Codable user override](#codable-user-override) — the originally-motivating use case from [Issue 5](#issue-5-codable-round-trips), allowing libraries to ship custom Codable wire formats without a hand-rolled wrapper enum. The two forms share implementation: once narrowed-`Any` is accepted as an extension target, both shapes parse and type-check through the same path; the only extra piece for Form 2 is wiring the conformance through `lookupConformance` so it shadows the synthesised default.
+
 ### Parameter packs collapsed into a narrowed-`Any`
 
 `each T` (SE-0393) describes a *positional* pack; `A | B | C` describes an *unordered closed set*. The two are dual. A future surface could let a parameter pack collapse into a narrowed-`Any` (`Pack { each T }` → `T1 | T2 | … | Tn`), but pack expansion is an operation whereas `A | B` is an identity, so the design is non-trivial.
 
 ### Codable user override
 
-Issue 5 in v1 ships untagged-only Codable. A follow-up should provide a user-extension hook for libraries that want a custom encoder/decoder pair — typically because their wire format expects a discriminator (OpenAPI's `oneOf`, serde-style tagged union) or a specific overlap-handling order beyond declaration order.
+Issue 5 in v1 ships untagged-only Codable. A follow-up should provide a user-extension hook for libraries that want a custom encoder/decoder pair — typically because their wire format expects a discriminator (OpenAPI's `oneOf`, serde-style tagged union) or a specific overlap-handling order beyond declaration order. The intended syntactic form is the natural one — a Codable conformance written as an extension on the narrowed-`Any`:
+
+```swift
+extension Int | String: Codable {
+    func encode(to encoder: Encoder) throws { ... }
+    init(from decoder: Decoder) throws { ... }
+}
+```
+
+This is the canonical motivator for lifting the v1 restriction on user-defined conformances over narrowed-`Any` (see [Conformance synthesis (v1 scope)](#conformance-synthesis-v1-scope)). The implementation gating is one piece of work — extending the mangler / Sema to accept narrowed-`Any` as an extension target — that simultaneously unblocks the more general [user-written extensions on narrowed-`Any`](#extending-a-narrowed-any-directly). Until that lands, libraries needing a custom Codable wire format hand-roll an enum wrapper for the field in question.
 
 ### True set-membership for `where T: A | B`
 
