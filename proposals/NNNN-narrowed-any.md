@@ -459,7 +459,7 @@ Type-checking a narrowed-`Any` cast walks six steps:
 
 The naive reading of these steps would be `O(n × m)` per cast site. The actual algorithm sorts each leaf set once by mangling (cached per-type on `TypeBase`), then a single merge walk classifies subset / overlap / disjoint in `O(n + m)`. The classification result for each `(sorted_L, sorted_R)` pair is itself memoised, so repeated cast sites of the same leaf-set shape are `O(1)`. With [Issue 7](#issue-7-large-or-deeply-nested-narrowed-any)'s `≤ 8`-leaf cap, even cold-cache worst-case is dozens of operations per site.
 
-This algorithm is not novel: it is the [Maranget-style pattern usefulness algorithm][maranget] (used by OCaml, Rust, Haskell, F#) specialised to a closed leaf-set sum type, with class/protocol subtyping applied at the leaf level. § [Alternatives considered](#alternatives-considered) places this in the broader cast-feasibility taxonomy.
+The algorithm is elementary — sorted-leaf-set intersection plus per-leaf class / protocol subtype walks for the "shared leaves" tally. The same closed-leaf-set reasoning underpins this proposal's *switch exhaustiveness* check, which is structurally a [Maranget-style pattern usefulness algorithm][maranget] (used by OCaml, Rust, Haskell, F# for exhaustiveness checking) specialised to closed-conformer existentials; cast feasibility is a simpler set-relation classification on the same closed leaf sets. § [Alternatives considered § Prior art: cast-feasibility algorithms](#prior-art-cast-feasibility-algorithms) places both checks in the broader taxonomy.
 
 #### Runtime semantics for `as?`
 
@@ -1033,11 +1033,11 @@ TypeScript's `string | number` is *structural*: a value-level set, members of th
 
 | Language | Syntax | Semantics |
 | --- | --- | --- |
-| Scala 3 | `A \| B` | Structural; *join* widens to LUB; subtyping lattice. |
-| Ceylon | `A\|B` | Structural; `T?` is sugar for `T \| Null`; first-class. |
-| TypeScript | `A \| B` | Structural; only intersection of properties visible; runtime by user-written `typeof`. |
-| Crystal | `Int32 \| String` | Compiler-inferred; method must exist on every alternative. |
-| Python (PEP 604) | `int \| str` | Type-hint only; no runtime semantics. |
+| Scala 3 | `A \| B` | Untagged sum; nominal leaves; **commutative** (`A \| B` ≡ `B \| A`); unboxed; member access via LUB. |
+| Ceylon | `A\|B` | First-class type-level union; nominal leaves; `T?` desugars to `T \| Null`; commutative. |
+| TypeScript | `A \| B` | Structural assignability over the alternatives; only the intersection of properties is visible; runtime narrowing by user-written `typeof` / `instanceof` checks. |
+| Crystal | `Int32 \| String` | Compiler-inferred from the set of values a binding can hold; method must exist on every alternative. |
+| Python (PEP 604) | `int \| str` | Type-hint sugar for `Union[int, str]`; no runtime semantics. |
 | Kotlin | none — uses sealed classes | Nominal closed hierarchy. |
 | F# | `type X = A of … \| B of …` | Discriminated union, *nominal*. |
 | Rust | `enum X { A(A), B(B) }` | Discriminated union, *nominal*. |
@@ -1050,7 +1050,7 @@ The previous subsection compared *spelling*. The compile-time question of "is th
 
 | Approach | Languages using it | What it does | Where this proposal sits |
 | --- | --- | --- | --- |
-| **Pattern usefulness** ([Maranget 2007][maranget]) | OCaml, Rust, Haskell, F# | Recursively walks patterns, computing which constructors are "useful" (covered / uncovered). For closed sum types this degenerates to "enumerate constructors and check coverage". Used for both exhaustiveness and reachability diagnostics. | The leaf-set extraction → sort → merge classification described in [Compile-time check](#compile-time-check) **is** Maranget's algorithm specialised to a closed leaf-set sum type, with class/protocol subtyping applied at the leaf level. The novelty is the *input shape* (anonymous closed-class-of-conformers existential), not the algorithm. |
+| **Pattern usefulness** ([Maranget 2007][maranget]) | OCaml, Rust, Haskell, F# | Recursively walks patterns, computing which constructors are "useful" (covered / uncovered). For closed sum types this degenerates to "enumerate constructors and check coverage". Used for both exhaustiveness and reachability diagnostics. | This proposal's *switch exhaustiveness* check is structurally Maranget pattern usefulness applied to closed-conformer existentials — `case _ as A`, `case _ as B`, … patterns are checked for whether they collectively cover the declared leaf set. The *cast-feasibility* check (the subset / overlap / disjoint classification of two leaf sets at an `as` / `as?` / `as!` site) is simpler — sorted-leaf-set intersection with class/protocol subtyping at the leaf level — and shares the closed-conformer reasoning rather than the full pattern-vector algebra. |
 | **Structural assignability with caching** | TypeScript | Recursive structural walk of `(source, target)`, memoised on the pair to handle cyclic types. The user-facing `x as T` is **trust-me** — no compile-time feasibility check beyond a lax "not totally disjoint" gate. | The two-layer cache borrows the memoisation idea but **rejects** the trust-me posture: disjoint is a hard error, subset-written-as-partial is a warning, every cast site is decided statically. |
 | **Subtype lattice with `glb` / `lub`** | Scala 3 union types | Treats `A \| B` as a lattice element: `A \| B <: C` ⟺ `A <: C ∧ B <: C`; `C <: A \| B` ⟺ `C <: A ∨ C <: B`. Cast (`asInstanceOf`) is **runtime-only** on the JVM. | Per-leaf class/protocol subtype walks use the same lattice intuition, but feasibility is decided at compile time, not deferred to runtime. |
 | **Subsumption (Roslyn)** | C# pattern matching | "Does this set of patterns subsume all reachable types?" Uses sealed-class info to bound the case set. Maranget-style with nominal subtyping. | Same subsume-the-closed-set posture, extended to *anonymous* closed sets created on the fly by `\|`. |
@@ -1058,7 +1058,7 @@ The previous subsection compared *spelling*. The compile-time question of "is th
 
 Two takeaways for reviewers:
 
-1. **The algorithm is not novel** — it is Maranget pattern usefulness narrowed to a closed leaf-set sum type. What is novel for Swift is choosing this *input shape* (an anonymous closed-class-of-conformers existential), then leaning on Swift's existing class-cast / conformance-lookup machinery for the per-leaf subtype questions.
+1. **Neither algorithm is novel.** Switch exhaustiveness over a closed leaf set is Maranget pattern usefulness specialised to closed-conformer existentials; cast feasibility is sorted-leaf-set intersection (an elementary set-relation classification) plus Swift's existing class-cast / conformance-lookup machinery applied per leaf. What is novel for Swift is choosing the *input shape* — an anonymous closed-class-of-conformers existential — and routing both checks through it.
 2. **The strictness on disjoint casts is deliberate.** TypeScript and Java leave that decision to the runtime; Scala 3 erases the type entirely on JVM. This proposal goes the other way for the same reason `switch` exhaustiveness on `enum` is statically checked: the closed shape makes it decidable, so it should be decided.
 
 ## Acknowledgements
