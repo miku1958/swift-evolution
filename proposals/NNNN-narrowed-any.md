@@ -406,12 +406,15 @@ if let n: Int | String = m as? Int | String {
     _ = n
 }
 
-// Compile errors — disjoint:
+// Compile errors:
 let o: Int | Double = 7
-o as String | Bool         // error: leaf sets disjoint
-o as String | Int          // error for `as`: not every source leaf fits target
+o as String | Bool         // error: leaf sets disjoint (no shared leaf)
 o as? String | Bool        // error: still disjoint, partial form does not help
 o as! String | Bool        // error: still disjoint, would trap unconditionally
+o as String | Int          // error: partial overlap — `as` requires every source leaf
+                           //        fit; Double has no home in `String | Int`. Use
+                           //        `as?` / `as!` for the runtime-decide form, or
+                           //        narrow the source first.
 ```
 
 #### Diagnostic and fix-it for implicit cross-shape
@@ -436,10 +439,10 @@ The same logic fires anywhere implicit conversion would have applied — assignm
 
 Where the closed leaf set makes the cast result statically determined and the cast is *not* outright disjoint, the compiler emits a warning rather than waiting for the runtime to give the only possible answer:
 
-* **Same-spelling cast** — `v: Int | String; v as Int | String` (or `as?`, or `as!`) is a no-op in every form. Warning: "redundant cast — source and target are the same type"; fix-it: drop the cast entirely. Same shape as Swift's existing "Cast from 'Int' to same type 'Int' has no effect".
+* **Same-spelling cast** — `v: Int | String; v as Int | String` (or `as?`, or `as!`) is a no-op in every form. The `as?` / `as!` cases are covered by Swift's existing "conditional cast from `T` to same type `T` always succeeds" / "forced cast of `T` to same type has no effect" warnings (which already fix-it to drop the cast). Plain `as` of a value to its own type is silent under existing Swift convention; the proposal does not introduce a new warning here.
 * **Subset cast with different spelling** — `v: Int | String; v as? String | Int` (or `as!`). The static `as` form does real work (rewraps under the target's spelling, which changes Codable order, mangled name, etc.); `as?` / `as!` are dead weight. Warning: "always succeeds; consider using `as`"; fix-it: drop the `?` / `!`.
 
-Disjoint leaf sets are *not* in this category — they are rejected outright per the rule table above, in any of the three cast forms.
+Disjoint leaf sets are *not* in this category — `as` / `as?` / `as!` are all hard errors when the leaf sets share no types in common (per the rule table above). `is` against disjoint leaf sets stays a warning, matching Swift's existing convention for statically-false `is` checks (the result is still a well-typed boolean false).
 
 #### Compile-time check
 
