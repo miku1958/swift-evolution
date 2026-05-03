@@ -352,7 +352,7 @@ The "not itself a narrowed-`Any`" carve-out matters: implicit conversion from on
 Generic containers do *not* covary in their element type:
 
 * `Array<A | B>` is *not* a subtype of `Array<A>`. `Array` is invariant; changing the element type changes the mangled name.
-* Extension dispatch on a generic with a narrowed-`Any` element constraint is **per-spelling** — `extension Array where Element == Int | String { … }` matches receivers of type `[Int | String]` exactly; `[String | Int]` (cross-spelling) and `[Int]` (leaf-injection lift) do *not* match in v1, consistent with [Spelling is identity](#spelling-is-identity). § [Containers and extensions](#containers-and-extensions) covers the rule and points to the [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses) future direction for the cross-spelling relaxation.
+* Extension dispatch on a generic with a narrowed-`Any` element constraint takes part in **per-element leaf injection**, the natural lift of value-level leaf injection to the container axis: `extension Array where Element == Int | String { … }` matches receivers of type `[Int | String]` (exact spelling), `[Int]`, and `[String]` — every concrete leaf type fits implicitly, just as `let v: Int | String = 7` accepts an `Int` value implicitly. Without this lift the extension form has no value over writing one extension per leaf. *Cross-spelling* receivers (`[String | Int]` matching the same extension) still need an explicit `as` cast in v1, consistent with [Spelling is identity](#spelling-is-identity); the [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses) future direction relaxes that. § [Containers and extensions](#containers-and-extensions) covers both axes.
 
 ### Implicit conversion
 
@@ -474,7 +474,7 @@ The runtime cost is one metadata-pointer comparison plus the rebox — roughly t
 
 ### Containers and extensions
 
-`Array<A | B>` is *not* a subtype of `Array<A>` (Array is invariant). Extension dispatch on a generic constrained by `where Element == narrowed-Any` is **per-spelling**: the extension matches receivers whose generic argument is the same narrowed-`Any` spelling as the constraint, and *only* that spelling. Cross-spelling and leaf-injection lift do not match implicitly — by design, per [Spelling is identity](#spelling-is-identity).
+`Array<A | B>` is *not* a subtype of `Array<A>` (Array is invariant). Extension dispatch on a generic constrained by `where Element == narrowed-Any` participates in **per-element leaf injection**: a leaf-typed array (`[A]` or `[B]`) matches an extension on `[A | B]` implicitly, the same way value-level leaf injection lets `let v: A | B = leafValue` work without an explicit cast. *Cross-spelling* receivers (a `[B | A]` array reaching an extension on `[A | B]`) still need an explicit `as` cast in v1, consistent with [Spelling is identity](#spelling-is-identity).
 
 ```swift
 extension Array where Element == String | Int {
@@ -486,13 +486,12 @@ let zs:  [Int | String] = [1, "a"]                 // same leaves, different spe
 let xs:  [String]       = ["a", "b"]               // single leaf, narrowed-`Any` is wider
 
 ys.summary()                                       // OK: same spelling
+xs.summary()                                       // OK: per-element leaf injection — every
+                                                   //     `String` element fits an `Int | String`
+                                                   //     element slot implicitly, so `[String]`
+                                                   //     fits `[Int | String]` element-wise.
 zs.summary()                                       // error: cross-spelling — reshape with `as`
 (zs as [String | Int]).summary()                   // OK: explicit reshape
-
-xs.summary()                                       // error: extension is on `[String | Int]`,
-                                                   // a value of `[String]` is a different generic
-                                                   // instantiation (leaf-injection at the
-                                                   // extension boundary is not implemented in v1).
 
 extension Array where Element == String {
     func leafOnly() -> String { ... }
@@ -504,11 +503,13 @@ ys.leafOnly()                                      // error: `[String | Int]` is
                                                    //     element is Int
 ```
 
-In one sentence: **extension dispatch is type-identity matching at the generic argument** — same narrowed-`Any` spelling matches; different spelling, leaf-injection lift, or narrowed → leaf downcast all need an explicit cast. Same convention Swift already enforces for any other generic constraint (`extension Array where Element == String { … }` does not match `[Int]`).
+The two axes of dispatch:
 
-The `(zs as [String | Int])` rewrite is *runtime-free*. Both `[Int | String]` and `[String | Int]` have bit-identical memory layout because each element is a narrowed-`Any` using the `Any`-singleton metadata regardless of leaf order — so the cast is a SIL-level type relabel, no element walk, no buffer reallocation. What changes is the type identity: extension dispatch resolves through the new spelling's witness, Codable encodes per the new spelling's order, and so on (per [Spelling is identity](#spelling-is-identity)).
+* **Leaf injection (implicit)** — `[A]` matches an extension on `[A | B]`. The whole point of writing the extension this way: behaviour declared for `[Int | String]` should naturally apply to a homogeneous `[Int]` or `[String]` too, because every leaf-typed element fits the wider element slot for free. Without this lift the extension form duplicates what one-extension-per-leaf already provides, and the user is left manually casting every leaf-typed array to access the wider extension's behaviour.
+* **Narrowed → leaf (explicit, partial)** — `[A | B]` reaching an extension on `[A]` needs `as? [A]` because the runtime might hold a `B` element. This is the dual direction; same shape as Swift's current `[Animal] as? [Dog]`.
+* **Cross-spelling (explicit, total)** — `[B | A]` reaching an extension on `[A | B]` needs `as [A | B]` to reshape the spelling. Runtime-free relabel (both arrays have bit-identical memory layout — each element is narrowed-`Any` using the `Any`-singleton metadata regardless of leaf order); only the type identity flips. Per [Spelling is identity](#spelling-is-identity), Codable encoding order, witness selection, and mangling all follow the new spelling.
 
-Two future-direction relaxations are sketched separately. § [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses) describes a `where Element ~= Int | String` opt-in marker so a single extension could cover any spelling whose sorted leaves agree (the cross-spelling axis). § [Per-element leaf injection at the extension boundary](#per-element-leaf-injection-at-the-extension-boundary) describes letting `[Int]` match an extension declared on `[Int | String]` (the leaf-injection axis). v1 keeps the conservative rule (per-spelling, no leaf-injection lift) so that Codable order, witness selection, and mangling stay tractable; both relaxations are left for follow-up review.
+The cross-spelling axis can be relaxed via the [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses) future direction (`where Element ~= Int | String` would let one extension cover any spelling whose sorted leaves agree). The leaf-injection axis is not optional — it ships with v1.
 
 ### Conformance synthesis (v1 scope)
 
@@ -813,6 +814,7 @@ Working today:
 
 Known v1 gaps (must land before review or planned for first follow-up):
 
+- **Per-element leaf injection at the extension boundary**: the proposal commits to letting `[Int]` and `[String]` match an extension declared on `Array where Element == Int | String` via per-element leaf injection (see § [Containers and extensions](#containers-and-extensions)). The current prototype rejects the lift; today users have to write `(xs as [Int | String]).method()` to access the extension. This must close before review — without it the `where Element == A | B` extension form provides no value over writing one extension per leaf, and the proposed value-vs-container leaf-injection symmetry breaks. Cross-spelling reshape via explicit `as` is verified working end-to-end (test bed `phase2_edge.swift §8`); only the implicit lift is missing.
 - **Per-witness dispatch** (`Hashable`, `Equatable`, `Comparable`, `CustomStringConvertible`, etc.): synth path today is gated on `isMarkerProtocol() || requiresSelfConformanceWitnessTable()`. v1 escape hatch: explicit `as! any P` (works, `phase2f-runtime.swift §8a` validates). See [Future directions § Per-narrowed-Any witness emission](#per-narrowed-any-witness-emission) for the design.
 - **swift-syntax sync**: companion fork at [miku1958/swift-syntax][fork-syntax], branch [`narrowed-any/syntax-sync`][fork-syntax-branch] (commit [`2973425f`][fork-syntax-commit]). Adds 3 syntax nodes — mechanical schema change + parser loop — to teach `swift-syntax` to recognise `A | B` natively. The branch is published but not yet upstreamed; the ABI / API surface is small and review-ready, but it ships in lockstep with the language change so the upstream PR will land alongside the swift-evolution proposal acceptance.
 
@@ -887,12 +889,6 @@ The relaxation is strictly more permissive than v1's rule, so adopting it later 
 ### Order-insensitive marker in `where` clauses
 
 Spelling-is-identity makes `[Int | String]` and `[String | Int]` distinct types, so generic code parameterised on `[T]` matches one shape only and every other shape needs an explicit cross-shape `as` at the call site. A future surface could introduce a where-clause marker — strawman `where T == Int | String unordered` or `where T ~= Int | String` — that opts a single generic binding into matching against any spelling whose sorted leaves agree, so inside such a generic both `[Int | String]` and `[String | Int]` satisfy `[T]` directly. The constraint-solver hook parasitises the [two-layer cache](#compile-time-check): comparing the binding's interned sorted-leaves identity instead of its canonical-type pointer is `O(1)` after first encounter, no new caches required. Spelling-is-identity stays the global default; this is opt-in for code that genuinely doesn't care (set-algebra over leaves, JSON/Codable wrappers that round-trip through a sorted-canonical wire format, the IDE-side cross-shape completion below sharing the same index). Two open design questions: marker spelling needs evolution review, and protocol-witness dispatch needs an explicit decision on whether marker-bound dispatch follows the caller's spelling (preserves the dispatch-level "spelling is identity" guarantee that v1's [conformance-synthesis escape hatch](#conformance-synthesis-v1-scope) inherits) or normalises to sorted-canonical form (cheaper but loosens that guarantee — the same loosening v1 was framed to avoid).
-
-### Per-element leaf injection at the extension boundary
-
-In v1, an extension declared on `Array where Element == Int | String` matches receivers of type `[Int | String]` exactly, but does *not* match `[Int]` or `[String]` even though `Int` and `String` are leaves of the constraint type. Leaf-injection lifts implicitly at the *value* level (`let v: Int | String = 7`) and at the *generic-call* site through the same-type degraded form of `where T: A | B` constraints, but the extension boundary is an additional surface where the lift would also be safe: every `[Int]` is operationally a valid `[Int | String]` value (each element promotes by leaf injection element-wise). A future direction could let extensions on `Array where Element == A | B` cover `[A]` and `[B]` receivers automatically.
-
-The cost is the same dispatch-coherence trade-off the [Order-insensitive marker](#order-insensitive-marker-in-where-clauses) future direction confronts: once `[Int]` matches an extension on `[Int | String]`, the extension's body sees the receiver as `[Int | String]`, but the value is actually `[Int]` — Codable encoding through the extension would write under `Int | String`'s declaration order, witness selection on the body's `Self.Element` would dispatch through `Int | String`'s witness rather than `Int`'s. Whether that re-routing is desirable depends on what the extension does. The conservative v1 rule keeps the witness identity stable; the relaxation is left for follow-up review where each side of the trade-off can be considered explicitly. This relaxation is *axis-orthogonal* to the order-insensitive marker — one is about cross-spelling matching, the other is about leaf-injection lift — so they could ship independently.
 
 ### SourceKit completion auto-inserts cross-shape cast
 
