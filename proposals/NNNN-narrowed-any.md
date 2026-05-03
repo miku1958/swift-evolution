@@ -486,7 +486,7 @@ let zs:  [Int | String] = [1, "a"]                 // same leaves, different spe
 let xs:  [String]       = ["a", "b"]               // single leaf, narrowed-`Any` is wider
 
 ys.summary()                                       // OK: same spelling
-zs.summary()                                       // error: cross-spelling — fix-it: ` as [String | Int]`
+zs.summary()                                       // error: cross-spelling — reshape with `as`
 (zs as [String | Int]).summary()                   // OK: explicit reshape
 
 xs.summary()                                       // error: extension is on `[String | Int]`,
