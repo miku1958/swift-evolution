@@ -794,7 +794,7 @@ In all three, the diagnostic computes the candidate intersection and offers a fi
 
 ## Implementation status
 
-Prototype on a fork of `swiftlang/swift` at [miku1958/swift][fork-swift], branch [`narrowed-any/phase1-poc`][fork-branch]. 11 lit tests at [`swift/test/NarrowedAny/`][fork-tests], 11/11 pass in ~18 seconds. The bullets below list every user-visible capability the prototype exercises today; the gap list afterward names what still has to land before the proposal is reviewable as a v1.
+Prototype on a fork of `swiftlang/swift` at [miku1958/swift][fork-swift], branch [`narrowed-any/phase1-poc`][fork-branch]. 12 lit tests at [`swift/test/NarrowedAny/`][fork-tests], 12/12 pass in ~17 seconds (11 runtime-positive `%target-run-simple-swift` files exercising end-to-end behaviour + 1 `%target-typecheck-verify-swift` file locking in the negative-path Sema diagnostics). The bullets below list every user-visible capability the prototype exercises today; the gap list afterward names what still has to land before the proposal is reviewable as a v1.
 
 Working today:
 
@@ -816,7 +816,7 @@ Known v1 gaps (must land before review or planned for first follow-up):
 - **Per-witness dispatch** (`Hashable`, `Equatable`, `Comparable`, `CustomStringConvertible`, etc.): synth path today is gated on `isMarkerProtocol() || requiresSelfConformanceWitnessTable()`. v1 escape hatch: explicit `as! any P` (works, `phase2f-runtime.swift §8a` validates). See [Future directions § Per-narrowed-Any witness emission](#per-narrowed-any-witness-emission) for the design.
 - **swift-syntax sync**: companion fork at [miku1958/swift-syntax][fork-syntax], branch [`narrowed-any/syntax-sync`][fork-syntax-branch] (commit [`2973425f`][fork-syntax-commit]). Adds 3 syntax nodes — mechanical schema change + parser loop — to teach `swift-syntax` to recognise `A | B` natively. The branch is published but not yet upstreamed; the ABI / API surface is small and review-ready, but it ships in lockstep with the language change so the upstream PR will land alongside the swift-evolution proposal acceptance.
 
-The prototype's test bed (`swift/test/NarrowedAny/`) exercises 11 lit tests covering the capabilities above. Cross-module compilation verifies the alternation round-trips through `.swiftmodule` and `.swiftinterface` formats; `-O` regression verifies optimisation-level transparency.
+The prototype's test bed (`swift/test/NarrowedAny/`) exercises 12 lit tests covering the capabilities above. Cross-module compilation verifies the alternation round-trips through `.swiftmodule` and `.swiftinterface` formats; `-O` regression verifies optimisation-level transparency; the verify-mode `diagnostics.swift` locks in the negative-path Sema diagnostics (disjoint cast errors, cross-spelling extension dispatch, the `extension Int | String { … }` non-nominal note) so future Sema work can't silently regress them.
 
 ## Future directions
 
