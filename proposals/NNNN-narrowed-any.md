@@ -797,6 +797,8 @@ Working today:
 - Self-conforming protocols (`Error`, `Sendable`, marker protocols) — full per-leaf dispatch via existential layout.
 - Untagged `Codable` round-trip across nested narrowed-`Any`, `Codable` containers, arrays of narrowed-`Any` (Issue 5 design).
 - `typed throws` end-to-end — exhaustive cross-domain `catch`, async / await transparent, rethrow-scope leak fixed.
+- [Per-leaf try-propagation](#try-propagation-is-per-leaf-not-per-spelling) — `try f()` accepts cross-spelling and leaf-subset propagation modulo Never (leaf-set subset wins, spelling-as-identity stays at the function-signature boundary). The runtime path is a SIL-level unchecked cast on the inner thrown value (Any-singleton layout is identical across spellings, so bytes don't move).
+- [Inhabited-subset rule for `Never` leaves](#uninhabited-never-leaves-and-the-inhabited-subset-rule) — `throws(A | Never)` requires `try` like `throws(A)`; `throws(Never | Never)` is non-throwing at the call site (multi-leaf extension of [SE-0413]'s `throws(Never)` rule); `switch v: Int | Never` is exhaustive without a `case _ as Never:` arm; the leaf-aware "missing case" hint never suggests `_ as Never`. Type identity is unchanged.
 - Generic `where T: A | B` (currently lowered to same-type degraded form `where T == A | B` — see [Future directions § True set-membership](#true-set-membership-for-where-t-a--b) for the full rule).
 - Set / Dict / Array stdlib integration, KeyPath, reflection.
 - Constraint solver tuple-leaf injection, enum-case dispatch, cross-domain catch arms.
