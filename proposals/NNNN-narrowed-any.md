@@ -236,7 +236,7 @@ describe(v)                          // OK: Int | String conforms to CustomStrin
 if let s = v as? String { s.append("x") }   // OK after explicit narrow
 ```
 
-This makes narrowed `Any` **strictly more useful than open `Any`** — it carries the witnesses for whatever `A` and `B` share, callable directly through the join's witness tables — but **strictly less surprising than TypeScript-style structural unions** — leaf-only methods (those not in the join) are rejected at compile time rather than dispatched dynamically.
+This makes narrowed `Any` **strictly more useful than open `Any`** — it carries the witnesses for whatever `A` and `B` share, callable directly through the join's witness tables — but **strictly less surprising than TypeScript-style structural unions** — leaf-only methods (those not in the join) are never magically synthesised, and there is no implicit narrowing through structural intersection or runtime `typeof` checks. Reaching a leaf-only method always requires explicit narrowing with `as?`, the same way Swift's `any P` requires opening the existential to call leaf-specific behaviour.
 
 **v1 prototype status.** The example above shows the *design* — per-witness dispatch through the join is the commitment described in [§ Conformance synthesis (v1 scope)](#conformance-synthesis-v1-scope), and the v1 review surface is that design. The current prototype ships only the self-conforming-protocol synthesis (`Error`, marker protocols); for protocols with method requirements (`Hashable`, `Equatable`, `Comparable`, `CustomStringConvertible`) the synthesis is **deferred from v1** with an explicit `as! any P` escape hatch — see [§ Conformance synthesis (v1 scope)](#conformance-synthesis-v1-scope) for the rationale and [Future directions § Per-narrowed-Any witness emission](#per-narrowed-any-witness-emission) for the follow-up that completes the example as shown.
 
@@ -573,15 +573,13 @@ func process<T: NetworkError | DecodingError>(_ error: T) {
 }
 
 // All three call sites are accepted by the constraint:
-process(NetworkError.timeout)         // leaf value
-process(DecodingError.malformed)      // leaf value (different leaf)
+process(NetworkError.timeout)         // leaf passed; T = NetworkError under set-membership
+process(DecodingError.malformed)      // leaf passed; T = DecodingError under set-membership
 let e: NetworkError | DecodingError = ...
-process(e)                            // alternation value
+process(e)                            // alternation passed; T = NetworkError | DecodingError
 ```
 
-The body type-checks against the *join* of the constraint's leaves — the body of `process` may use any member that every leaf provides, but cannot use leaf-only members without first narrowing with `as?`. This matches what the body of a function taking `A | B` directly already sees.
-
-**v1 binding rule.** v1 lowers `where T: A | B` to the same-type degraded form `where T == A | B`, so inside the body `T` is always bound to the alternation type itself, regardless of which leaf the caller passed; leaf-typed call sites work via implicit leaf-injection at the call boundary. Full set-membership specialisation — letting the body see `T` as the bound leaf when the substitution is one — is sketched as [Future directions § True set-membership for `where T: A | B`](#true-set-membership-for-where-t-a--b) and shares a constraint-solver hook with the order-insensitive-marker future direction. The order-freeness rule above ("`where T: A | B` and `where T: B | A` accept the same set of substitutions") and the `switch` over `error` shown in the body are unaffected by the v1 lowering.
+The body type-checks against the *join* of the constraint's leaves — the body of `process` may use any member that every leaf provides, but cannot use leaf-only members without first narrowing with `as?`. This matches what the body of a function taking `A | B` directly already sees. (v1 implements this constraint via the same-type degraded form `T == A | B`, so the body always sees `T` as the alternation regardless of what the caller passed; full per-leaf binding is the [True set-membership](#true-set-membership-for-where-t-a--b) future direction. The set-membership reading at the *constraint* level is independent of the body-binding axis.)
 
 **One narrowed-`Any` constraint per type parameter.** Multiple narrowed-`Any` clauses (`where T: A | B, T: C | D`) and the three `&`-with-narrowed-`Any` interactions (`(A | B) & P`, `(A | B) & SomeClass`, `(A | B) & (C | D)`) are **all rejected** with a diagnostic. Reasons and fix-it details are spelled out in § [Issue 6](#issue-6-generic-constraints-where-t-a--b) and § [Issue 9](#issue-9-interaction-with--protocol-composition--superclass).
 
