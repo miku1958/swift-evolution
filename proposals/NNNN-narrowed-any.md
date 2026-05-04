@@ -519,6 +519,8 @@ The three axes of dispatch:
 
 In short: cross-spelling is a free relabel (O(1)); leaf injection is an O(N) wrap with 4× transient memory peak; narrowed → leaf is an O(N) walk with conditional success. All three are explicit-`as` / `as?` in v1. The leaf-injection diagnostic carries an auto-fix-it that inserts the cast; the cross-spelling diagnostic currently doesn't (separate diagnostic-quality follow-up; see [Implementation status](#implementation-status)).
 
+**Most-specific-wins on overlap.** When multiple `where Element == …` extensions overlap, Swift's existing extension-dispatch rule picks the most-specific one based on the receiver's static generic argument. So if both `extension Array where Element == Int { … }` and `extension Array where Element == Int | String { … }` are in scope, an `xs: [Int]` receiver calls the `Element == Int` version directly — same as Swift's existing class-hierarchy override resolution. The leaf-injection lift documented above (and its v1 explicit-cast surface) only kicks in for methods that the *more-specific* extension does not provide. This is the container-axis analogue of the receiver-static-type-priority rule documented for value-axis dispatch in [§ Future directions § Extending a narrowed-`Any` directly](#ext-rule-leaf-reach).
+
 **Library-author guidance for avoiding the upfront wrap.** When the extension can be expressed as a `Sequence` or `Collection` requirement rather than `Array`-specific, library authors should prefer the wider protocol — it lets users pay leaf-injection cost lazily per element rather than upfront for the whole array:
 
 ```swift
@@ -1039,7 +1041,27 @@ extension Int | String: Codable {
 Two design rules anchor the follow-up:
 
 <a id="ext-rule-leaf-reach"></a>
-**Leaf-typed receivers reach narrowed-`Any` extension methods via implicit subtype lift.** Per `A <: A | B` (the subtype rule from § [Subtyping lattice](#subtyping-lattice)), a `let n: Int = 7; n.describe()` call where `describe` lives on `extension Int | String { … }` resolves through the narrowed-`Any` extension by an implicit `Any`-singleton box at the receiver — O(1), operationally identical to `let v: Int | String = n; v.describe()`. This is the natural lift of value-level leaf injection (`let v: Int | String = 7`) to the method-dispatch axis: where the value-level rule says "a leaf may flow into a narrowed-`Any`-typed slot without a cast", the method-dispatch rule says "a leaf-typed receiver may reach a method declared on the narrowed-`Any` it's a leaf of". On overload (both `extension Int { describe() }` and `extension Int | String { describe() }` exist), Swift's existing most-specific-wins resolution prefers the leaf-side extension exactly the way it prefers a leaf-side override over an inherited base method today; users can force the wider extension via explicit `(n as Int | String).describe()`. Container-axis dispatch (`xs: [Int]` reaching `extension Array where Element == Int | String`) follows the same design intent, but ships in v1 as **explicit-cast-with-fix-it** rather than implicit because the per-element layout differs (8-byte raw `Int` slots vs. 32-byte `Any`-singleton slots) and the conversion is O(N); see [Per-element leaf injection at the extension boundary](#per-element-leaf-injection-at-the-extension-boundary). The *value*-axis lift is O(1) (single box) and matches the value-binding axis directly, so no such retreat is needed.
+**Receiver's static type owns its method-dispatch priority.** Method lookup on a narrowed-`Any` value (or a leaf value of a narrowed-`Any`) follows Swift's existing most-specific-wins rule, applied to the type lattice with the `A <: A | B` subtype edge from § [Subtyping lattice](#subtyping-lattice):
+
+1. **Receiver typed `A` (a leaf).** Lookup walks `A`'s own extensions first; if none has the method, walks up to `A | B`'s extensions (implicit `Any`-singleton box at the receiver — O(1), operationally identical to `let v: Int | String = leaf; v.method()`); finally falls back to standard Swift lookup (protocol conformances etc.).
+2. **Receiver typed `A | B`.** Lookup walks `A | B`'s own extensions first; if none has the method, falls back to the *join* (members provided by every leaf via protocol conformance — see § [The join](#the-join-what-members-are-visible)).
+
+So when both an `extension Int { describe() }` and an `extension Int | String { describe() }` are in scope:
+
+```swift
+extension Int          { func describe() -> String { "Int" } }
+extension Int | String { func describe() -> String { "Int | String" } }
+
+let a: Int          = 7;   a.describe()  // "Int"           — Int's own extension wins
+let b: Int | String = 7;   b.describe()  // "Int | String"  — Int | String's own extension wins
+let c: String       = "x"; c.describe()  // "Int | String"  — String has no own describe(), reaches via subtype lift
+```
+
+This is exactly the rule Swift already applies to class-extension dispatch (`extension Animal { … }` vs. `extension Dog: Animal { … }` resolve by receiver static type), generalised to narrowed-`Any` because `A <: A | B` is just another edge in the subtype lattice. Users can force the wider extension on a leaf-typed receiver via explicit `(value as Int | String).describe()` when they need the wider behaviour.
+
+The lift to narrowed-`Any` extension methods is the natural lift of value-level leaf injection (`let v: Int | String = 7`) to the method-dispatch axis: same box, same cost (O(1) per call), same dispatch shape — only the source-level ergonomics differ.
+
+**Container-axis dispatch** (`xs: [Int]` reaching `extension Array where Element == Int | String`) follows the same design intent — most-specific-wins, with subtype-lift as fallback — but ships in v1 as **explicit-cast-with-fix-it** rather than implicit because the per-element layout differs (8-byte raw `Int` slots vs. 32-byte `Any`-singleton slots) and the conversion is O(N); see [Per-element leaf injection at the extension boundary](#per-element-leaf-injection-at-the-extension-boundary). The *value*-axis lift is O(1) (single box) and matches the value-binding axis directly, so no such retreat is needed there.
 
 <a id="ext-rule-fallback"></a>
 **User-declared extensions take priority over the v1 synthesis fallback.** The auto-synthesised conformances from § [Conformance synthesis (v1 scope)](#conformance-synthesis-v1-scope) (untagged Codable, marker / self-conforming protocols, eventual per-witness dispatch) act as *implicit fallback witnesses* that fire when no user-declared extension provides the conformance. A user-written `extension Int | String: Codable { ... }` is the explicit declaration; the synthesis steps aside. There is no "duplicate conformance" conflict because the v1 synthesis is a fallback rule, not a declared conformance — same shape as how a concrete type's own witness already shadows a protocol-extension default implementation in Swift today.
