@@ -591,7 +591,7 @@ A subtle case [raised on the forums by ksluder][ksluder-post-55]: if a downstrea
 
 ### Generics: `where T: A | B`
 
-A constraint `where T: A | B` reads as **set membership**: `T` is a member of the closed leaf set `{A, B}`. The constraint is *order-free* — `where T: A | B` and `where T: B | A` accept the same set of substitutions, because what matters is whether `T`'s dynamic type lies in the leaf set, not how the constraint was spelled.
+A constraint `where T: A | B` reads as **set membership**: `T` is a member of the closed leaf set `{A, B}`. The substitution check is *spelling-aware*: `where T: A | B` and `where T: B | A` are different constraints (the bindings of `T` they produce have different mangled names and witness identities, per [Spelling is identity](#spelling-is-identity)). A value spelled in the reverse order can be passed in via an explicit `as` reshape (the runtime cost is a free SIL relabel; the explicit cast surfaces the spelling change at the call site).
 
 ```swift
 func process<T: NetworkError | DecodingError>(_ error: T) {
@@ -601,14 +601,20 @@ func process<T: NetworkError | DecodingError>(_ error: T) {
     }
 }
 
-// All three call sites are accepted by the constraint:
 process(NetworkError.timeout)         // leaf passed; T = NetworkError under set-membership
 process(DecodingError.malformed)      // leaf passed; T = DecodingError under set-membership
-let e: NetworkError | DecodingError = ...
-process(e)                            // alternation passed; T = NetworkError | DecodingError
+let e1: NetworkError | DecodingError = ...
+process(e1)                           // alternation passed; T = NetworkError | DecodingError
+let e2: DecodingError | NetworkError = ...
+process(e2)                           // ERROR: same leaf set but different spelling. Spelling-as-identity
+                                      // applies: `T = NetworkError | DecodingError` and `T = DecodingError | NetworkError`
+                                      // are different bindings (different mangled name, different witness
+                                      // identity). Reshape is a runtime-free relabel but must be explicit so
+                                      // the user sees the spelling change.
+                                      // Fix-it: `process(e2 as NetworkError | DecodingError)`.
 ```
 
-The body type-checks against the *join* of the constraint's leaves — the body of `process` may use any member that every leaf provides, but cannot use leaf-only members without first narrowing with `as?`. This matches what the body of a function taking `A | B` directly already sees. (v1 implements this constraint via the same-type degraded form `T == A | B`, so the body always sees `T` as the alternation regardless of what the caller passed; full per-leaf binding is the [True set-membership](#true-set-membership-for-where-t-a--b) future direction. The set-membership reading at the *constraint* level is independent of the body-binding axis.)
+The body type-checks against the *join* of the constraint's leaves — the body of `process` may use any member that every leaf provides, but cannot use leaf-only members without first narrowing with `as?`. This matches what the body of a function taking `A | B` directly already sees. (v1 implements this constraint via the same-type degraded form `T == A | B`, so the body always sees `T` as the alternation regardless of which leaf the caller passed; full per-leaf binding is the [True set-membership](#true-set-membership-for-where-t-a--b) future direction.)
 
 <a id="one-narrowed-any-constraint-per-type-parameter"></a>
 **One narrowed-`Any` constraint per type parameter.** Multiple narrowed-`Any` clauses (`where T: A | B, T: C | D`) and the three `&`-with-narrowed-`Any` interactions (`(A | B) & P`, `(A | B) & SomeClass`, `(A | B) & (C | D)`) are **all rejected** with a diagnostic. Reasons and fix-it details are spelled out in § [Issue 6](#issue-6-generic-constraints-where-t-a--b) and § [Issue 9](#issue-9-interaction-with--protocol-composition--superclass).
@@ -650,7 +656,7 @@ This rule answers @Nobody1707's `throws(Err<Never, Never>)` worry from the [pitc
 <a id="open-question-never-collapse-and-extension-matching"></a>
 **Open question for review** (Pitch-stage TODO, not a fixed v1 commitment): should the inhabited-subset rule extend to extension `where Element == ...` matching? Currently *no* — spelling-as-identity wins, so an extension declared on `Array where Element == Int | Never` does *not* apply to `[Int]` values even though leaf sets are operationally equivalent. Extending Never-collapse to extension lookup would re-introduce an exception that subverts spelling-as-identity. The recommended v1 stance keeps extension matching strict-spelling and routes the user to the [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses) future direction if they explicitly opt in.
 
-**v1 conservatism + two future relaxations.** What v1 *does* give you at constraint position is leaf-set order-freeness: `where T: A | B` and `where T: B | A` are the same constraint. What v1 *does not* give you is (a) full set-membership specialisation — the body sees `T` as the alternation, not as the bound leaf when bound — and (b) cross-spelling matching at extension-`where Element == ...` clauses, where v1 honours [Spelling is identity](#spelling-is-identity). Both relaxations are sketched as Future directions: § [True set-membership for `where T: A | B`](#true-set-membership-for-where-t-a--b) addresses the binding axis, and § [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses) addresses the spelling axis. They are independent and share the same constraint-solver hook (per-binding sorted-leaves identity).
+**v1 conservatism + two future relaxations.** v1 commits to [Spelling is identity](#spelling-is-identity) everywhere a narrowed-`Any` is bound to a name — including the constraint position. `where T: A | B` and `where T: B | A` are *different* constraints (the bindings have different mangled names and witness identities), and a caller passing a value spelled `B | A` into a function declared with `T: A | B` reshapes through an explicit `as` cast (with a fix-it surfacing the cross-spelling change). What v1 *does not* give you is (a) full set-membership specialisation — the body sees `T` as the alternation, not as the bound leaf when bound — and (b) cross-spelling matching at extension-`where Element == ...` clauses, where v1 honours [Spelling is identity](#spelling-is-identity). Both relaxations are sketched as Future directions: § [True set-membership for `where T: A | B`](#true-set-membership-for-where-t-a--b) addresses the binding axis (and includes the order-free leaf-set match at constraint position as the natural extension of disjunctive requirements), and § [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses) addresses the spelling axis at extension-clause level via an explicit opt-in marker.
 
 ### Exhaustiveness diagnostics
 
@@ -820,11 +826,11 @@ The decoder path is implemented in the prototype, with untagged round-trip acros
 
 **Question.** What does `where T: A | B` mean? Does order matter? Can you write multi-clause `where T: A | B, T: C | D`? Can `&` appear anywhere?
 
-**Resolution.** *Set membership.* `where T: A | B` means `T`'s dynamic type lies in the closed leaf set `{A, B}`. The constraint is **order-free** — `where T: A | B` and `where T: B | A` accept the same set of substitutions. Once `T` is bound to a concrete leaf, the substitution recovers spelling-as-identity at every type-position use of `T`.
+**Resolution.** *Set membership.* `where T: A | B` means `T`'s dynamic type lies in the closed leaf set `{A, B}`. The substitution check is **spelling-aware**: `where T: A | B` and `where T: B | A` are different constraints because they produce bindings of `T` with different mangled names and witness identities — [Spelling is identity](#spelling-is-identity) extends to constraint position. A caller that has a value spelled `B | A` and wants to call a function declared with `T: A | B` reshapes via an explicit `as` cast at the call site (free SIL relabel; the cast surfaces the spelling change). Lifting that explicit-cast requirement to a fully order-free leaf-set match — where `where T: A | B` and `where T: B | A` accept the same set of substitutions and pick the right binding from the call-site value — is part of the [True set-membership](#true-set-membership-for-where-t-a--b) future direction; it requires disjunctive requirements at the constraint-solver level.
 
 **Single narrowed-`Any` constraint per type parameter.** Multi-clause (`where T: A | B, T: C | D`) is rejected — there is no obvious correct meaning (intersection? union of unions?) and the diagnostics for the two interpretations are confusing. § [Issue 9](#issue-9-interaction-with--protocol-composition--superclass) covers the related ban on `&`-with-narrowed-`Any`.
 
-**Constraint position is order-free; type position is not.** `throws(A | B)` is a *type position* (the spelling is part of the function signature's identity); a protocol method declared `throws(A | B)` and an implementation written `throws(B | A)` are two different signatures, and the compiler reports "does not conform to protocol" with a fix-it that reorders the implementation. The constraint-position order-freeness from `where T: A | B` does *not* leak out to type position.
+**Both constraint and type positions honour Spelling is identity.** `throws(A | B)` is a *type position* (the spelling is part of the function signature's identity); a protocol method declared `throws(A | B)` and an implementation written `throws(B | A)` are two different signatures, and the compiler reports "does not conform to protocol" with a fix-it that reorders the implementation. `where T: A | B` is a *constraint position*; passing a value spelled `B | A` requires an explicit `as` reshape at the call site for the same reason — different spelling, different binding identity, different witness selection.
 
 ### Issue 7: Large or deeply-nested narrowed `Any`
 
@@ -1146,9 +1152,9 @@ This is the canonical motivator for lifting the v1 restriction on user-defined c
 
 ### True set-membership for `where T: A | B`
 
-v1 lowers `where T: A | B` to the same-type degraded form `where T == A | B` — the constraint is satisfiable by the alternation type itself, but the body cannot specialise `T` to a single leaf. A full set-membership rule would let the body see `T` as a leaf when the substitution actually is one (and as the alternation when it isn't), which requires disjunctive requirements at the constraint solver level. This is a substantial constraint-solver project on its own.
+v1 lowers `where T: A | B` to the same-type degraded form `where T == A | B`: the constraint is satisfiable by the alternation type itself or by a single leaf at the call site (leaf-injection), but reverse-spelling alternations (`B | A`) require an explicit `as` reshape at the call site (per [Spelling is identity](#spelling-is-identity)), and the body always sees `T` as the alternation rather than as the bound leaf even when the caller passed one. A full set-membership rule would relax both axes: (a) accept reverse-spelling values without a cast — the constraint becomes a closed-leaf-set predicate where `where T: A | B` and `where T: B | A` accept the same substitutions, with the binding's spelling taken from the caller's value; (b) let the body specialise `T` to a single leaf when the substitution actually is one. Both require disjunctive requirements at the constraint solver level. This is a substantial constraint-solver project on its own.
 
-A natural pairing for that work is § [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses), which addresses the *spelling* axis of the same constraint surface: full set-membership lets the body specialise `T` to a single leaf when bound; the order-insensitive marker lets the binding match against any spelling whose sorted leaves agree. The two are independent — either can land first — but they share the same constraint-solver hook (per-binding sorted-leaves identity) and would benefit from a single round of design review.
+A natural pairing for that work is § [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses), which addresses the *extension-clause* axis of the same constraint surface (`extension Array where Element == A | B` matching against `[B | A]` receivers via an explicit opt-in marker). The two are independent — either can land first — but they share the same constraint-solver hook (per-binding sorted-leaves identity) and would benefit from a single round of design review.
 
 ### SIL-level optimisation passes
 
