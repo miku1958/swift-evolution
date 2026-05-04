@@ -222,15 +222,19 @@ extension String: CustomStringConvertible { ... }
 
 let v: Int | String = "hi"
 
-// Direct join-member access — `description` is a CustomStringConvertible member
-// and both Int and String conform, so it is in the join and dispatches through
-// the synthesised witness:
-print(v.description)                 // OK: dispatches via the join's CustomStringConvertible witness
-print("v=\(v)")                      // OK: string interpolation goes through the same witness
-
-// Generic-position dispatch with the same join protocol — works the same way:
+// Generic-position dispatch through the join — works in v1:
 func describe<T: CustomStringConvertible>(_ x: T) { print(x) }
 describe(v)                          // OK: Int | String conforms to CustomStringConvertible via the join
+
+// String interpolation likewise dispatches via the synthesised witness:
+print("v=\(v)")                      // OK: appendInterpolation finds the witness through the join
+
+// Direct member access on the existential value — currently rejected by
+// the prototype with "member cannot be used on value of type 'V';
+// consider using a generic constraint instead". This is a v1 gap
+// relative to `any P` (which DOES allow direct member access) — see
+// § [Implementation status](#implementation-status) for the open work.
+// v.description                     // error today; should match `any P` behaviour
 
 // Leaf-only methods — rejected at compile time, because they are not in the
 // join. To use a leaf-specific method, narrow first with `as?`:
@@ -238,9 +242,9 @@ describe(v)                          // OK: Int | String conforms to CustomStrin
 if let s = v as? String { s.append("x") }   // OK after explicit narrow
 ```
 
-This makes narrowed `Any` **strictly more useful than open `Any`** — it carries the witnesses for whatever `A` and `B` share, callable directly through the join's witness tables — but **strictly less surprising than TypeScript-style structural unions** — leaf-only methods (those not in the join) are never magically synthesised, and there is no implicit narrowing through structural intersection or runtime `typeof` checks. Reaching a leaf-only method always requires explicit narrowing with `as?`, the same way Swift's `any P` requires opening the existential to call leaf-specific behaviour.
+This makes narrowed `Any` **strictly more useful than open `Any`** — it carries the witnesses for whatever `A` and `B` share, reachable through generic-position dispatch and string interpolation — but **strictly less surprising than TypeScript-style structural unions** — leaf-only methods (those not in the join) are never magically synthesised, and there is no implicit narrowing through structural intersection or runtime `typeof` checks. Reaching a leaf-only method always requires explicit narrowing with `as?`, the same way Swift's `any P` requires opening the existential to call leaf-specific behaviour.
 
-**v1 prototype status.** The example above shows the *design* — per-witness dispatch through the join is the commitment described in [§ Conformance synthesis (v1 scope)](#conformance-synthesis-v1-scope), and the v1 review surface is that design. The current prototype ships only the self-conforming-protocol synthesis (`Error`, marker protocols); for protocols with method requirements (`Hashable`, `Equatable`, `Comparable`, `CustomStringConvertible`) the synthesis is **deferred from v1** with an explicit `as! any P` escape hatch — see [§ Conformance synthesis (v1 scope)](#conformance-synthesis-v1-scope) for the rationale and [Future directions § Per-narrowed-Any witness emission](#per-narrowed-any-witness-emission) for the follow-up that completes the example as shown.
+**v1 prototype status.** The per-witness conformance synthesis itself **is wired** for the standard library's protocols with method requirements — `Equatable`, `Hashable`, `Comparable`, `CustomStringConvertible`, `Encodable`, `Decodable` — via the builtin `NarrowedAnyDispatch` conformance kind in `lib/AST/ConformanceLookup.cpp` plus per-leaf SIL dispatch helpers in `lib/SILGen/SILGenType.cpp`. So `describe(v)`, string interpolation `"\(v)"`, `Set<Int | String>`, `JSONEncoder().encode(v)`, etc. all work in v1 (validated by `phase3f_*.swift` lit tests). The remaining v1 gap is **direct member access on the existential value** — `v.description` is rejected today even though the conformance is fully synthesised, requiring users to route through generic-position dispatch (`describe(v)`) or interpolation (`"\(v)"`). Reaching `any P` parity for direct member access is tracked in § [Implementation status](#implementation-status); fixing it is mechanical (the conformance machinery is ready) and intended before review.
 
 The join is computed lazily on first access and cached as a field on `TypeBase`. First access walks each leaf's protocol-conformance list and class-hierarchy chain, intersecting and finding the LCA; subsequent access is `O(1)`. The constituent lookups (`Module::lookupConformance`, `ClassDecl::getSuperclassDecl`) are themselves already memoised by Swift's `TypeChecker` / `ASTContext`, so even cold-start is bounded by a handful of hash queries.
 
@@ -550,24 +554,20 @@ Three classes of protocol conformance for `A | B`, in order of how they reach th
 | ------------------------------ | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Self-conforming**      | `Error`, marker protocols (`Sendable`, `AnyObject`, `Copyable`)                                   | The existential layout itself acts as the witness — same `SelfProtocolConformance` Swift already uses for `any Error`. **Fully working in the prototype.** No new compiler code required.                                                                                                                                              |
 | **Untagged structural**  | `Codable`                                                                                               | Compiler synthesises encode/decode that walks the alternation in declaration order: encode emits the leaf value directly with no wrapper or discriminator; decode tries each leaf in order until one succeeds.**Working in the prototype** (see § [Implementation status](#implementation-status)). § [Issue 5](#issue-5-codable-round-trips) describes the design and decode-error model. |
-| **Per-witness dispatch** | `Hashable`, `Equatable`, `Comparable`, `CustomStringConvertible`, others with method requirements | Requires real witness-table emission with thunks that open the existential and dispatch to each leaf's own conformance.**Deferred from v1** — see [Future directions § Per-narrowed-Any witness emission](#per-narrowed-any-witness-emission). The v1-era escape hatch for these protocols is explicit `as! any P`:                        |
+| **Per-witness dispatch** | `Hashable`, `Equatable`, `Comparable`, `CustomStringConvertible`, `Encodable`, `Decodable`                | **Working in the prototype.** Implemented via a dedicated `BuiltinConformance` kind `NarrowedAnyDispatch` (`lib/AST/ConformanceLookup.cpp::lookupExistentialConformance`) plus six per-protocol SIL dispatch helpers in `lib/SILGen/SILGenType.cpp` that emit witness thunks opening the existential and forwarding to each leaf's own conformance. So `JSONEncoder().encode(v)`, `Set<Int \| String>`, `<` over `Int \| Double`, `\(v)` interpolation, etc. all work today (validated by `phase3f_codable_*.swift`, `phase3f_equatable.swift`, plus the Codable round-trip in `codable_untagged.swift`). |
 
 ```swift
 let v: Int | String = 42
-let data = try JSONEncoder().encode(v as! any Encodable)  // works today
+let data = try JSONEncoder().encode(v)            // works in v1; no `as! any Encodable` needed
+let s: Set<Int | String> = [42, "hello", 42]      // 2 elements, dedup via Hashable
+let n: Int | Double = 1
+let m: Int | Double = 2.5
+print(n < m)                                       // true, via Comparable
 ```
 
-Once the per-witness synthesis lands in a follow-up, the `as!` becomes redundant and the user code collapses through three stages, each with the standard Swift diagnostic chain:
+**Why we commit to per-witness dispatch as the design** (rather than the alternative of auto-erasing `A | B` into `any P` whenever every leaf conforms to `P`): auto-erasure would lose [Spelling is identity](#spelling-is-identity) at the protocol-dispatch level, because two values with different spellings would observably behave the same once erased. Per-witness dispatch keeps spelling intact at the witness boundary — `Int | String` and `String | Int` both conform to (say) `Hashable`, but each routes through its own builtin conformance with the spelling preserved.
 
-```swift
-encode(v as! any Encodable)   // ⚠ "Forced cast … always succeeds; use `as`"   (fix-it: drop `!`)
-encode(v as any Encodable)    // OK — explicit existential erasure, allowed by convention
-encode(v)                     // OK — implicit erasure, same path Swift takes for `encode(5)`
-```
-
-So existing v1-era `as!` adoption code automatically rots into actionable warnings as the compiler grows the conformance — the migration is mechanical. The same chain applies in let-binding and `return` positions; assignment-style `let p: any P = v` is the standard `T: P → any P` erasure rule.
-
-**Why route 1 (per-witness dispatch) is the design we commit to**, even though v1 ships without the synthesis: the alternative — auto-erasing `A | B` into `any P` whenever every leaf conforms to `P` — would lose [Spelling is identity](#spelling-is-identity) at the protocol-dispatch level, because two values with different spellings would observably behave the same once erased. v1 leaves the synthesis door open so the conformance can land later without changing the user-visible model.
+**Open v1 gap.** Direct member access on the existential (`v.description` for `v: Int | String`) is currently rejected even though the `CustomStringConvertible` conformance is fully synthesised — the conformance is reachable via generic-position dispatch (`describe(v)`), string interpolation (`"\(v)"`), and any-cast (`(v as any CustomStringConvertible).description`), but not directly. Reaching `any P` parity for direct member access on the narrowed-`Any` value is mechanical Sema work (the conformance machinery is already wired) and is the remaining v1 polish item; see § [Implementation status](#implementation-status).
 
 **User-defined extensions on `A | B` are deferred to a follow-up.** v1 ships only the synthesised conformances above; user-written `extension Int | String { func ... }` and `extension Int | String: P { ... }` are rejected with a tailored diagnostic that points users at the v1 workarounds (extend each leaf type individually, or write a generic function with `where T: A | B`). When the follow-up lands, `Int | String` is treated as a first-class extension target — methods and conformances declared on it directly **take priority over the synthesised behaviour** above, the way a concrete type's own witness already shadows a protocol-extension default in Swift today. So `extension Int | String: Codable { ... }` for libraries with bespoke wire formats (OpenAPI discriminator, custom try-order beyond declaration order) is the user-override hook for the v1 untagged-Codable synthesis, not a re-declaration of an existing conformance: the v1 synthesis is an *implicit fallback*, not a *declared* conformance, so Swift's "no duplicate conformance" rule does not fire. See [Future directions § Extending a narrowed-`Any` directly](#extending-a-narrowed-any-directly) and [§ Codable user override](#codable-user-override). The v1 rejection is *not* a permanent design choice; it is the conservative starting point that defers the mangling work to a focused follow-up.
 
@@ -733,7 +733,7 @@ Concretely:
 - Every narrowed-`Any` value reuses the **`Any` singleton metadata pointer** at runtime — `Any`'s metadata has been in the Swift runtime since 1.0.
 - Every cast goes through the existing **`swift_dynamicCast`** entry point — same runtime symbol used today by `cat as? Animal` and `v as? any P`.
 - The closed-class-of-conformers table (point #6 of the [compile-time check](#compile-time-check)) is **emitted by IRGen as static linked data in the user's binary**, not as a new runtime artefact; the runtime simply reads it via the existing conformance-descriptor lookup path.
-- The new conformance kind for synthesised protocol conformances (the per-witness dispatch route, [deferred from v1](#per-narrowed-any-witness-emission)) is a compile-time concept; the witness tables it eventually produces will be normal witness tables full of SIL thunk functions, dispatched via existing `witness_method` machinery.
+- The conformance kind for synthesised protocol conformances (the per-witness dispatch route, `BuiltinConformance(NarrowedAnyDispatch)`) is a compile-time concept; the witness tables it produces are normal witness tables full of SIL thunk functions, dispatched via existing `witness_method` machinery — already shipped in v1 for `Equatable` / `Hashable` / `Comparable` / `CustomStringConvertible` / `Encodable` / `Decodable`.
 
 In other words: every "new" thing this proposal introduces lives either in the *type-checker* (two-layer cache, leaf-set classification, conformance synthesis) or in the *user's binary* (closed-class-of-conformers tables, witness thunks). The runtime side has nothing new to learn. Code compiled against an older runtime continues to run correctly when the same source is re-compiled with a newer toolchain that supports `A | B` — the same back-deployment story Swift has for SE-0335 `any P`, property wrappers, result builders, and similar compile-time-only features.
 
@@ -853,6 +853,7 @@ Working today:
 - Cross-shape `as` / `as?` / `as!` runtime via `swift_dynamicCast` with closed-leaf-set post-check.
 - Pattern matching exhaustiveness, `switch` over narrowed-`Any` with leaf-naming arms.
 - Self-conforming protocols (`Error`, `Sendable`, marker protocols) — full per-leaf dispatch via existential layout.
+- **Per-witness dispatch** for stdlib protocols with method requirements — `Equatable`, `Hashable`, `Comparable`, `CustomStringConvertible`, `Encodable`, `Decodable` — implemented via the `BuiltinConformance(NarrowedAnyDispatch)` kind in `lib/AST/ConformanceLookup.cpp` plus six per-protocol SIL dispatch helpers in `lib/SILGen/SILGenType.cpp`. `JSONEncoder().encode(v)`, `Set<Int | String>`, `Comparable.<` over `Int | Double`, `\(v)` interpolation through the `CustomStringConvertible` witness — all work today; validated by `phase3f_codable_*.swift` and `phase3f_equatable.swift`.
 - Untagged `Codable` round-trip across nested narrowed-`Any`, `Codable` containers, arrays of narrowed-`Any` (Issue 5 design).
 - `typed throws` end-to-end — exhaustive cross-domain `catch`, async / await transparent, rethrow-scope leak fixed.
 - [Per-leaf try-propagation](#try-propagation-is-per-leaf-not-per-spelling) — `try f()` accepts cross-spelling and leaf-subset propagation modulo Never (leaf-set subset wins, spelling-as-identity stays at the function-signature boundary). The runtime path is a SIL-level unchecked cast on the inner thrown value (Any-singleton layout is identical across spellings, so bytes don't move).
@@ -867,7 +868,7 @@ Known v1 gaps (must land before review or planned for first follow-up):
 - **Per-element leaf injection fix-it at the extension boundary**: when a leaf-typed receiver (`xs: [Int]`) reaches an extension on a narrowed-`Any` element (`extension Array where Element == Int | String`), v1 emits the existing same-type-requirement error with a fix-it that inserts `(receiver as [Int | String])` before the call. The fix-it makes the cast one keystroke; users see "error → click → fixed". Wired in `lib/Sema/CSDiagnostics.cpp`'s `RequirementFailure::diagnoseAsError` — fires when the requirement is `SameType`, the rhs is `NarrowedAnyType`, and the lhs is a leaf of the rhs (recursively, including nested narrowed-`Any`); locks in by `diagnostics.swift §8b` verify-mode annotations. The *implicit* form (no cast at all) is deferred to a follow-up — see [Future directions § Per-element leaf injection at the extension boundary](#per-element-leaf-injection-at-the-extension-boundary). Explicit-cast (`(xs as [Int | String]).method()`) is verified working end-to-end (test bed `phase2_edge.swift §8`); the SIL path for the cast itself is mature.
 
   **Cross-spelling diagnostic-quality gap** (`zs: [Int | String]` reaching `extension Array where Element == String | Int`): the diagnostic for that axis surfaces through a *different* code path — per-alternative type comparison emitting "any Int" vs. "any String" — which doesn't carry narrowed-`Any` context, so the fix-it above doesn't activate. The cross-spelling cast itself works end-to-end via explicit `(zs as [String | Int]).method()` (runtime-free relabel, validated in `phase2_edge.swift §8`); only the diagnostic quality is below the leaf-injection bar. A separate Sema follow-up reshapes the diagnostic emission to recognise the narrowed-`Any` parent types and attach an analogous fix-it. Marked as a known v1 limitation in `diagnostics.swift §8a`; not blocked on v1 review.
-- **Per-witness dispatch** (`Hashable`, `Equatable`, `Comparable`, `CustomStringConvertible`, etc.): synth path today is gated on `isMarkerProtocol() || requiresSelfConformanceWitnessTable()`. v1 escape hatch: explicit `as! any P` (works, `phase2f-runtime.swift §8a` validates). See [Future directions § Per-narrowed-Any witness emission](#per-narrowed-any-witness-emission) for the design.
+- **Direct member access on the narrowed-`Any` existential value**: `let v: Int | String = "hi"; v.description` is rejected today even though the `CustomStringConvertible` conformance is fully synthesised (see § [Conformance synthesis (v1 scope)](#conformance-synthesis-v1-scope)). The conformance is reachable via generic-position dispatch (`describe(v)`), string interpolation (`"\(v)"`), and explicit any-cast (`(v as any CustomStringConvertible).description`); only the *direct* member access path on the narrowed-`Any`-typed value rejects. Reaching `any P` parity for direct member access is mechanical Sema work (the conformance machinery is wired) and is the remaining v1 polish item; intended before review.
 - **swift-syntax sync**: companion fork at [miku1958/swift-syntax][fork-syntax], branch [`narrowed-any/syntax-sync`][fork-syntax-branch] (commit [`2973425f`][fork-syntax-commit]). Adds 3 syntax nodes — mechanical schema change + parser loop — to teach `swift-syntax` to recognise `A | B` natively. The branch is published but not yet upstreamed; the ABI / API surface is small and review-ready, but it ships in lockstep with the language change so the upstream PR will land alongside the swift-evolution proposal acceptance.
 
 The prototype's test bed (`swift/test/NarrowedAny/`) exercises 12 lit tests covering the capabilities above. Cross-module compilation verifies the alternation round-trips through `.swiftmodule` and `.swiftinterface` formats; `-O` regression verifies optimisation-level transparency; the verify-mode `diagnostics.swift` locks in the negative-path Sema diagnostics (disjoint cast errors, cross-spelling extension dispatch, the `extension Int | String { … }` non-nominal note) so future Sema work can't silently regress them.
@@ -876,13 +877,20 @@ The prototype's test bed (`swift/test/NarrowedAny/`) exercises 12 lit tests cove
 
 Items deliberately deferred from v1. Each is a follow-up proposal in its own right; v1 leaves the design door open without committing to a specific surface.
 
-### Per-narrowed-Any witness emission
+<a id="per-narrowed-any-witness-emission"></a>
+### Generalised per-narrowed-Any witness emission
 
-The conformance synthesis for protocols with method requirements (`Hashable`, `Equatable`, `Comparable`, `CustomStringConvertible`, and most user-written protocols) is the largest deferred item. v1 ships with the explicit `as! any P` escape hatch (see [Conformance synthesis (v1 scope)](#conformance-synthesis-v1-scope)); the follow-up replaces that with compiler-emitted witness tables containing SIL thunks that open the existential, cast into each leaf in declaration order, and forward via `witness_method` against the leaf's own conformance.
+v1 ships per-witness dispatch via the `BuiltinConformance(NarrowedAnyDispatch)` kind for the six stdlib protocols with method requirements (`Equatable`, `Hashable`, `Comparable`, `CustomStringConvertible`, `Encodable`, `Decodable`); each protocol has a hand-written SIL dispatch helper in `lib/SILGen/SILGenType.cpp` that emits witness thunks opening the existential and forwarding to each leaf's own conformance. This generalises naturally to arbitrary protocols, but the v1 prototype hardcodes the helper-per-protocol shape because each protocol's witness signature varies (number of args, return shape, `throws` / `async`, generic constraints in the requirement, etc.) and synthesising the dispatch generically requires a more involved Sema + SILGen pass.
 
-Why a separate proposal: the SIL verifier rejects the obvious shortcut (short-circuiting `lookupExistentialConformance` to `getSelfConformance(P)`), so this needs a genuinely new `BuiltinProtocolConformance` flavour (`NarrowedAnyDispatch`) plus IRGen work to emit the thunks, plus linker-coalesce-friendly mangling so duplicate `(A | B, P)` thunks across translation units collapse. Each piece is mechanical but adds Sema and IRGen surface that benefits from a focused review.
+A follow-up generalises the synthesis to **any** protocol whose methods can be dispatched per-leaf — covering both user-written protocols (`protocol P { func foo() -> Int }`) and stdlib protocols not currently in the hardcoded set. The shape of the work:
 
-Once it lands, v1-era `as! any P` adoption code automatically rots into actionable warnings — the migration is mechanical.
+1. **Generic SIL synthesis driver.** Given a `BuiltinConformance(NarrowedAnyDispatch, A | B, P)`, walk `P`'s requirements; for each method requirement, emit a thunk that opens the narrowed-`Any`, casts into each leaf via `swift_dynamicCast` (or the closed-leaf-set fast path), forwards to the leaf's own conformance witness via `witness_method`, and merges the return values. Cross-leaf return-type variance (associated types) needs explicit thinking.
+2. **`throws` / `async` / `mutating` / generic-method requirements.** Each axis adds a wrinkle the v1 hardcoded helpers handle ad-hoc; the generalised driver needs principled coverage.
+3. **Linker-coalesce-friendly mangling** so duplicate `(A | B, P)` thunks across translation units collapse, even for user-defined protocols.
+
+Until this lands, user-written protocols on narrowed-`Any` route through the v1 fallback ("doesn't conform" diagnostic at compile time), and users can either constrain their generic via `where T: A | B` (which uses set-membership and works in v1) or wait for the generalisation.
+
+The user-extension override path ([§ Codable user override](#codable-user-override) / [§ Extending a narrowed-`Any` directly](#extending-a-narrowed-any-directly)) is independent of this generalisation: a user who writes `extension Int | String: P { ... }` provides explicit witnesses, not a synthesised dispatch.
 
 ### Witness-merge: replacing multiple overloads with one narrowed-`Any` signature
 
