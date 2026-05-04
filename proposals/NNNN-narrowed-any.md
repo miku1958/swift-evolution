@@ -660,16 +660,17 @@ Adding a leaf to a published `throws(A | B)` declaration (`throws(A | B | C)`) e
 
 ### Mangling
 
-A new mangling operator `XN` extends the existing `X`-namespaced operator subgrammar. The subscript-style EBNF:
+A new mangling operator `XN` extends the existing `X`-namespaced operator subgrammar. Alternatives are mangled as a standard postfix list (the same shape used elsewhere in Swift's mangling for tuple elements, function parameters, and protocol composition members), terminated by the `XN` operator:
 
 ```
-narrowed-any-mangling ::= 'XN' decimal type-list ; the integer is leaf count
-type-list             ::= type+
+narrowed-any-mangling ::= alternative-list 'XN'
+alternative-list      ::= type ('_' type)*
+                       | 'y'                     ; empty list (defensive; not produced for valid types)
 ```
 
-So `Int | String` mangles as `XN2SiSS` (count 2, then `Int`, then `String`); `(Int | Double) | String` as `XN2XN2SiSdSS` (outer count 2, first leaf is itself a narrowed-`Any` of count 2, then `Int`, `Double`, then the outer's second leaf `String`). Spelling-as-identity is preserved in the mangling: `Int | String` and `String | Int` mangle to different symbols (`XN2SiSS` vs `XN2SSSi`), so they have distinct ABI identities even when their leaf sets are equal.
+So `Int | String` mangles as `Si_SSXN` (`Int`, `_` list separator, `String`, then `XN`); `(Int | Double) | String` as `Si_SdXN_SSXN` (the outer list has two alternatives: the first is itself a narrowed-`Any` `Si_SdXN`, then `_`, then the outer's second leaf `SS`, then the outer `XN`). Spelling-as-identity is preserved: `Int | String` and `String | Int` mangle to different symbols (`Si_SSXN` vs `SS_SiXN`), so they have distinct ABI identities even when their leaf sets are equal.
 
-Lower-case `n` in the `X`-namespace was already taken by parameter packs (`Xn`); upper-case `N` was free. No collisions with existing manglings.
+Lower-case `n` in the `X`-namespace was already taken by parameter packs (`Xn`); upper-case `N` was free. No collisions with existing manglings. The list-as-postfix shape (rather than a leading count) matches the surrounding mangling conventions: alternatives are emitted in declaration order, separated by `_` between adjacent types, with the operator at the end signalling the list's role to the demangler.
 
 ### Grammar (EBNF)
 
