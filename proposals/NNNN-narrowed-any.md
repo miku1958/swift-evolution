@@ -781,31 +781,31 @@ Each issue states the question, the resolution chosen, and a one-paragraph ratio
 
 **Question.** `|` is `BitwiseOr` in expression context today. Reusing it for type-list separation needs to be unambiguous.
 
-**Resolution.** Parser already has the type/expression context bit (the same one that distinguishes `Int?` from postfix `?`); reuse it. In a type position, `|` is the type-list separator; in an expression position, it remains `BitwiseOr.|`. Concretely: after `:`, `->`, `as`, `is`, inside `<…>`, inside `throws(…)`, after `any`, inside `[…]` when the bracket opens an array/dictionary type — those are the type-position triggers.
+**Proposed resolution.** Parser already has the type/expression context bit (the same one that distinguishes `Int?` from postfix `?`); reuse it. In a type position, `|` is the type-list separator; in an expression position, it remains `BitwiseOr.|`. Concretely: after `:`, `->`, `as`, `is`, inside `<…>`, inside `throws(…)`, after `any`, inside `[…]` when the bracket opens an array/dictionary type — those are the type-position triggers.
 
 ### Issue 2: Function-type parenthesization
 
 **Question.** `A | B -> C` is ambiguous between `A | (B -> C)` and `(A | B) -> C`.
 
-**Resolution.** Parens are required *only* in positions where the alternation would otherwise be ambiguous with another type-level construct. In any position with a `:` label closing the type context (e.g. `(_ value: Int | String) -> Void`, `(_: Int | String, Int)`), parens are *not* required. Anonymous parameter / return / tuple-element positions still require parens when the alternation contains a `->` or comma that could rebind. § [Source-level surface](#source-level-surface) lists the exact form.
+**Proposed resolution.** Parens are required *only* in positions where the alternation would otherwise be ambiguous with another type-level construct. In any position with a `:` label closing the type context (e.g. `(_ value: Int | String) -> Void`, `(_: Int | String, Int)`), parens are *not* required. Anonymous parameter / return / tuple-element positions still require parens when the alternation contains a `->` or comma that could rebind. § [Source-level surface](#source-level-surface) lists the exact form.
 
 ### Issue 3: Interaction with `Optional<T>` and `T?`
 
 **Question.** `T?` is sugar for `Optional<T>`. Does `T | nil` work? Does `T | T?` collapse?
 
-**Resolution.** `nil` is a literal, not a type — `T | nil` is a *parser error* with a fix-it suggesting `T?` (which is unrelated to the alternation). `T | T?` is a legal narrowed-`Any` with leaves `{T, Optional<T>}` — no collapse, no warning, per [Spelling is identity](#spelling-is-identity). The two leaves are different runtime types (`T` vs `Optional<T>` carry different metadata) so the cast machinery works as expected.
+**Proposed resolution.** `nil` is a literal, not a type — `T | nil` is a *parser error* with a fix-it suggesting `T?` (which is unrelated to the alternation). `T | T?` is a legal narrowed-`Any` with leaves `{T, Optional<T>}` — no collapse, no warning, per [Spelling is identity](#spelling-is-identity). The two leaves are different runtime types (`T` vs `Optional<T>` carry different metadata) so the cast machinery works as expected.
 
 ### Issue 4: Overlapping types
 
 **Question.** `T | T`, `Cat | Animal` (where `Cat: Animal`), `Int | (Int | String)`, etc. — should the compiler warn or normalise?
 
-**Resolution.** Neither. The compiler is silent on these cases, treats them as written, and lets the pattern-match exhaustiveness checker do the heavy lifting. The user wrote a specific spelling because they wanted that spelling. The only structural diagnostic that fires is the size warning (§ [Issue 7](#issue-7-large-or-deeply-nested-narrowed-any)), and that is purely about cognitive load.
+**Proposed resolution.** Neither. The compiler is silent on these cases, treats them as written, and lets the pattern-match exhaustiveness checker do the heavy lifting. The user wrote a specific spelling because they wanted that spelling. The only structural diagnostic that fires is the size warning (§ [Issue 7](#issue-7-large-or-deeply-nested-narrowed-any)), and that is purely about cognitive load.
 
 ### Issue 5: Codable round-trips
 
 **Question.** How does `A | B` encode and decode?
 
-**Resolution.** Untagged. Encoding writes the leaf value directly with no wrapper or discriminator. Decoding tries each leaf in declaration order until one succeeds. If all leaves fail, decoding propagates the *last* leaf's underlying decode error verbatim — the user receives a `DecodingError` shaped exactly like Swift's existing single-type decode failures, surfaced from whichever leaf was tried last. A future direction may wrap the all-fail case in a fresh `DecodingError.typeMismatch` annotated with the full leaf set, surfacing every leaf's per-attempt error as `underlyingError` chains; v1 ships the simpler last-leaf-error shape.
+**Proposed resolution.** Untagged. Encoding writes the leaf value directly with no wrapper or discriminator. Decoding tries each leaf in declaration order until one succeeds. If all leaves fail, decoding propagates the *last* leaf's underlying decode error verbatim — the user receives a `DecodingError` shaped exactly like Swift's existing single-type decode failures, surfaced from whichever leaf was tried last. A future direction may wrap the all-fail case in a fresh `DecodingError.typeMismatch` annotated with the full leaf set, surfacing every leaf's per-attempt error as `underlyingError` chains; v1 ships the simpler last-leaf-error shape.
 
 ```swift
 let v: Int | String = 5
@@ -841,7 +841,7 @@ The decoder path is implemented in the prototype, with untagged round-trip acros
 
 **Question.** What does `where T: A | B` mean? Does order matter? Can you write multi-clause `where T: A | B, T: C | D`? Can `&` appear anywhere?
 
-**Resolution.** *Set membership.* `where T: A | B` means `T`'s dynamic type lies in the closed leaf set `{A, B}`. The substitution check is **spelling-aware**: `where T: A | B` and `where T: B | A` are different constraints because they produce bindings of `T` with different mangled names and witness identities — [Spelling is identity](#spelling-is-identity) extends to constraint position. A caller that has a value spelled `B | A` and wants to call a function declared with `T: A | B` reshapes via an explicit `as` cast at the call site (free SIL relabel; the cast surfaces the spelling change). Lifting that explicit-cast requirement to a fully order-free leaf-set match — where `where T: A | B` and `where T: B | A` accept the same set of substitutions and pick the right binding from the call-site value — is part of the [True set-membership](#true-set-membership-for-where-t-a--b) future direction; it requires disjunctive requirements at the constraint-solver level.
+**Proposed resolution.** *Set membership.* `where T: A | B` means `T`'s dynamic type lies in the closed leaf set `{A, B}`. The substitution check is **spelling-aware**: `where T: A | B` and `where T: B | A` are different constraints because they produce bindings of `T` with different mangled names and witness identities — [Spelling is identity](#spelling-is-identity) extends to constraint position. A caller that has a value spelled `B | A` and wants to call a function declared with `T: A | B` reshapes via an explicit `as` cast at the call site (free SIL relabel; the cast surfaces the spelling change). Lifting that explicit-cast requirement to a fully order-free leaf-set match — where `where T: A | B` and `where T: B | A` accept the same set of substitutions and pick the right binding from the call-site value — is part of the [True set-membership](#true-set-membership-for-where-t-a--b) future direction; it requires disjunctive requirements at the constraint-solver level.
 
 **Single narrowed-`Any` constraint per type parameter.** Multi-clause (`where T: A | B, T: C | D`) is rejected — there is no obvious correct meaning (intersection? union of unions?) and the diagnostics for the two interpretations are confusing. § [Issue 9](#issue-9-interaction-with--protocol-composition--superclass) covers the related ban on `&`-with-narrowed-`Any`.
 
@@ -851,7 +851,7 @@ The decoder path is implemented in the prototype, with untagged round-trip acros
 
 **Question.** Should `Int | UInt | Int8 | UInt8 | Int16 | UInt16 | Int32 | UInt32 | Int64 | UInt64 | Float | Double` (twelve leaves) be diagnosed?
 
-**Resolution.** Soft-warn at **8 flat leaves** (`narrowed_any_size_warning`), suggesting "consider using a named enum or a generic constraint with a sealed protocol". Threshold chosen empirically from a sweep of stdlib + Swift test suites: 95th percentile of in-use enum case counts is 8.
+**Proposed resolution.** Soft-warn at **8 flat leaves** (`narrowed_any_size_warning`), suggesting "consider using a named enum or a generic constraint with a sealed protocol". Threshold chosen empirically from a sweep of stdlib + Swift test suites: 95th percentile of in-use enum case counts is 8.
 
 The warning is suppressible per use site; it is not an error. There is no warning for nesting depth as such — `(A | B) | C` (depth 2, 3 leaves) is fine; `(A | B | C | D | E | F | G | H | I)` (depth 1, 9 leaves) hits the threshold.
 
@@ -859,7 +859,7 @@ The warning is suppressible per use site; it is not an error. There is no warnin
 
 **Question.** Is `(Int | String, Bool)` the same as `(Int, Bool) | (String, Bool)`?
 
-**Resolution.** No. They are different types with different mangled names. `(Int | String, Bool)` is a 2-tuple whose first element is a narrowed-`Any`; the runtime carries a 2-tuple value with the first slot containing an `Any`-singleton metadata pointer. `(Int, Bool) | (String, Bool)` is a narrowed-`Any` whose leaves are themselves tuples; the value is a single `Any`-singleton with a tuple metadata pointer.
+**Proposed resolution.** No. They are different types with different mangled names. `(Int | String, Bool)` is a 2-tuple whose first element is a narrowed-`Any`; the runtime carries a 2-tuple value with the first slot containing an `Any`-singleton metadata pointer. `(Int, Bool) | (String, Bool)` is a narrowed-`Any` whose leaves are themselves tuples; the value is a single `Any`-singleton with a tuple metadata pointer.
 
 The two have different `as` rules (the first allows independent leaf injection per element; the second requires casting between full tuple types). Pattern matching destructures them differently as well. This is a special case of [Spelling is identity](#spelling-is-identity).
 
@@ -867,7 +867,7 @@ The two have different `as` rules (the first allows independent leaf injection p
 
 **Question.** What does `(A | B) & P` (mixing narrowed-`Any` with protocol composition) mean?
 
-**Resolution.** Rejected. All three forms are diagnosed as errors:
+**Proposed resolution.** Rejected. All three forms are diagnosed as errors:
 
 - `(A | B) & P` — a narrowed-`Any` intersected with a protocol composition: ambiguous (does it filter the leaves down to those conforming to `P`? add `P` to the join?).
 - `(A | B) & SomeClass` — a narrowed-`Any` intersected with a class: same ambiguity.
