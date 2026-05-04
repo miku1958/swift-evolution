@@ -984,7 +984,18 @@ When every leaf is small and POD (`Bool | UInt8`, `Int8 | Int16`, `Int32 | Float
 **The qualifier list is narrow.** Leaf sets that **don't** qualify for this follow-up:
 
 - **Any leaf that isn't POD.** Reference-counted types (`String`, `URL`, classes, `any AnyObject`), types containing reference counts (`String` because of its storage backing, `Optional<class>`, `Array<T>`), and any type whose value-witness table demands non-trivial copy/destroy. Tagging requires the runtime to never look at the value-witness table for storage management; non-POD leaves break that.
-- **Leaves whose total stride exceeds the size budget.** Even all-POD leaf sets like `Int | UInt32` (8 + 4 bytes) need ≥ 9-byte total layout (8-byte payload + 1-bit tag), which on 8-byte alignment rounds up to 16 bytes — still beats 32, but the optimisation is most valuable when payloads have spare bits the tag can borrow (`Float`'s NaN payload, `Bool`'s 7 unused bits, `Int8`'s sign bits).
+- **All-POD leaf sets without a spare bit the tag can borrow.** The optimisation packs `discriminator + payload` into a single value; the discriminator needs at least one bit to distinguish leaves. The only way to avoid an extra tag byte is to **borrow a spare bit pattern from one of the payloads** — and that requires the largest leaf to leave some bit pattern unused. Concretely:
+
+  | Leaf set | payload | spare bit available? | unaligned size | aligned stride |
+  |---|---|---|---|---|
+  | `Bool \| UInt8` | 1 byte | ✅ `Bool` uses 1 bit, leaving 7 spare | 1 byte | **1 byte** |
+  | `Int8 \| Int16` | 2 bytes | ✅ tag in `Int16`'s sign-bit-adjacent free region | 2 bytes | **2 bytes** |
+  | `Int32 \| Float` | 4 bytes | ✅ tag in `Float`'s NaN payload (~2²² free patterns) | 4 bytes | **4 bytes** |
+  | `Int \| Double` | 8 bytes | ✅ tag in `Double`'s NaN payload (~2⁵² free patterns; classic NaN-boxing) | 8 bytes | **8 bytes** |
+  | `Int \| UInt32` | 8 bytes | ❌ `Int` uses the full 64-bit range; `UInt32`'s zero high bits collide with low `Int` values, so they can't be the tag | **9 bytes** | **16 bytes** |
+  | `Int \| Int` (legal under spelling-as-identity) | 8 bytes | ❌ same reason | 9 bytes | 16 bytes |
+
+  The "spare bit available" column is the load-bearing one. `Int | UInt32` is all-POD and small, but `Int` saturates its 64-bit range with no spare bit pattern, and `UInt32` stored in an 8-byte slot has its high 32 bits as zeros — which collide with low-positive-integer `Int` values (`UInt32(7)` and `Int(7)` are bit-identical when both stored in a 64-bit slot). With no spare bit to borrow, the tag needs a standalone byte; 8-byte payload + 1-byte tag = 9 bytes, which on `Int`'s 8-byte alignment rounds up to 16 bytes per element. Still beats 32 (Any-singleton), but doesn't hit the word-size sweet spot that `Bool | UInt8` or `Int | Double` reach.
 
 So `Int | String`, `URL | Data`, `NetworkError | DecodingError` (where each Error case carries reference-counted message strings or wrapped types) — these stay on the existential layout. The follow-up's primary beneficiaries are typed-throws error sets where every leaf is a small POD enum (status codes, fixed-size error variants), and Embedded Swift workloads that can't tolerate `swift_dynamicCast` regardless of leaf shape.
 
