@@ -523,8 +523,10 @@ The three axes of dispatch:
 
 In short: cross-spelling is a free relabel (O(1)); leaf injection is an O(N) wrap with 4× transient memory peak; narrowed → leaf is an O(N) walk with conditional success. All three are explicit-`as` / `as?` in v1. The leaf-injection diagnostic carries an auto-fix-it that inserts the cast; the cross-spelling diagnostic currently doesn't (separate diagnostic-quality follow-up; see [Implementation status](#implementation-status)).
 
+<a id="most-specific-wins-on-overlap"></a>
 **Most-specific-wins on overlap.** When multiple `where Element == …` extensions overlap, Swift's existing extension-dispatch rule picks the most-specific one based on the receiver's static generic argument. So if both `extension Array where Element == Int { … }` and `extension Array where Element == Int | String { … }` are in scope, an `xs: [Int]` receiver calls the `Element == Int` version directly — same as Swift's existing class-hierarchy override resolution. The leaf-injection lift documented above (and its v1 explicit-cast surface) only kicks in for methods that the *more-specific* extension does not provide. This is the container-axis analogue of the receiver-static-type-priority rule documented for value-axis dispatch in [§ Future directions § Extending a narrowed-`Any` directly](#ext-rule-leaf-reach).
 
+<a id="library-author-guidance-for-avoiding-the-upfront-wrap"></a>
 **Library-author guidance for avoiding the upfront wrap.** When the extension can be expressed as a `Sequence` or `Collection` requirement rather than `Array`-specific, library authors should prefer the wider protocol — it lets users pay leaf-injection cost lazily per element rather than upfront for the whole array:
 
 ```swift
@@ -569,6 +571,7 @@ print(n < m)                                       // true, via Comparable
 
 **Open v1 gap.** Direct member access on the existential (`v.description` for `v: Int | String`) is currently rejected even though the `CustomStringConvertible` conformance is fully synthesised — the conformance is reachable via generic-position dispatch (`describe(v)`), string interpolation (`"\(v)"`), and any-cast (`(v as any CustomStringConvertible).description`), but not directly. Reaching `any P` parity for direct member access on the narrowed-`Any` value is mechanical Sema work (the conformance machinery is already wired) and is the remaining v1 polish item; see § [Implementation status](#implementation-status).
 
+<a id="user-defined-extensions-deferred-to-followup"></a>
 **User-defined extensions on `A | B` are deferred to a follow-up.** v1 ships only the synthesised conformances above; user-written `extension Int | String { func ... }` and `extension Int | String: P { ... }` are rejected with a tailored diagnostic that points users at the v1 workarounds (extend each leaf type individually, or write a generic function with `where T: A | B`). When the follow-up lands, `Int | String` is treated as a first-class extension target — methods and conformances declared on it directly **take priority over the synthesised behaviour** above, the way a concrete type's own witness already shadows a protocol-extension default in Swift today. So `extension Int | String: Codable { ... }` for libraries with bespoke wire formats (OpenAPI discriminator, custom try-order beyond declaration order) is the user-override hook for the v1 untagged-Codable synthesis, not a re-declaration of an existing conformance: the v1 synthesis is an *implicit fallback*, not a *declared* conformance, so Swift's "no duplicate conformance" rule does not fire. See [Future directions § Extending a narrowed-`Any` directly](#extending-a-narrowed-any-directly) and [§ Codable user override](#codable-user-override). The v1 rejection is *not* a permanent design choice; it is the conservative starting point that defers the mangling work to a focused follow-up.
 
 #### Cast safety
@@ -579,8 +582,10 @@ The cast surface (`as?` / `as!` / `is` / `case let _ as T:`) gets two correctnes
 
 A subtle case [raised on the forums by ksluder][ksluder-post-55]: if a downstream module imports a third-party type and *retroactively* makes it conform to a protocol that one of the alternatives in `A | B` already conforms to, does that change the joined interface? And does adding a retroactive conformance silently turn a previously exhaustive switch into a non-exhaustive one?
 
+<a id="retroactive-conformance-join-monotonic"></a>
 **The join.** A retroactive conformance can only *add* protocols to the join, never remove them. The join of `A | B` is the *intersection* of `{P : A: P}` and `{P : B: P}`; both sets monotonically grow as new conformances arrive at link time. The visible interface of `Int | String` therefore widens, never narrows, when a downstream module retroactively conforms `Int` and `String` to a new protocol. This is identical to how `any P & Q`'s join behaves under retroactive conformance today, and we inherit that behaviour without ceremony.
 
+<a id="retroactive-conformance-and-exhaustiveness"></a>
 **Exhaustiveness.** Switch over `A | B` is exhaustive over the *declared* alternatives, not over conformers of the join. A retroactive conformance that happens to make `String` conform to a protocol someone else's switch case mentions cannot turn a previously exhaustive `switch` into a non-exhaustive one — the alternatives are spelled by name, fixed at the point `A | B` is written, and remain exhaustive against that closed set. The retroactive conformance only affects which *additional* methods are dispatchable through the join.
 
 ### Generics: `where T: A | B`
@@ -604,8 +609,10 @@ process(e)                            // alternation passed; T = NetworkError | 
 
 The body type-checks against the *join* of the constraint's leaves — the body of `process` may use any member that every leaf provides, but cannot use leaf-only members without first narrowing with `as?`. This matches what the body of a function taking `A | B` directly already sees. (v1 implements this constraint via the same-type degraded form `T == A | B`, so the body always sees `T` as the alternation regardless of what the caller passed; full per-leaf binding is the [True set-membership](#true-set-membership-for-where-t-a--b) future direction. The set-membership reading at the *constraint* level is independent of the body-binding axis.)
 
+<a id="one-narrowed-any-constraint-per-type-parameter"></a>
 **One narrowed-`Any` constraint per type parameter.** Multiple narrowed-`Any` clauses (`where T: A | B, T: C | D`) and the three `&`-with-narrowed-`Any` interactions (`(A | B) & P`, `(A | B) & SomeClass`, `(A | B) & (C | D)`) are **all rejected** with a diagnostic. Reasons and fix-it details are spelled out in § [Issue 6](#issue-6-generic-constraints-where-t-a--b) and § [Issue 9](#issue-9-interaction-with--protocol-composition--superclass).
 
+<a id="throws-position-is-type-position"></a>
 **Throws position.** `throws(A | B)` is a *type position* (not a constraint position): the spelling is part of the function signature's identity. A protocol method declared `throws(NetworkError | DecodingError)` and an implementation written `throws(DecodingError | NetworkError)` are two *different* signatures; the compiler reports "does not conform to protocol" with a fix-it that reorders the implementation. Constraint-position order-freeness does not extend to type-position. § [Issue 6](#issue-6-generic-constraints-where-t-a--b) covers the asymmetry.
 
 <a id="try-propagation-is-per-leaf-not-per-spelling"></a>
@@ -634,10 +641,12 @@ The runtime thrown value is always *one concrete leaf* — both leaves of `doAno
 - `switch v` over `v: A | Never`: no `case _ as Never:` arm required for exhaustiveness — that leaf is unreachable, so omitting it is not a "missing case" diagnostic.
 - `Codable` for `A | Never`: encode never sees a `Never` value (the dynamic type can never be uninhabited, so the type-directed dispatcher never reaches that arm); decode skips the `Never` leaf in the declaration-order try sequence (constructing a `Never` value would always fail). Operationally identical to `A`'s `Codable`.
 
+<a id="never-collapse-does-not-affect-type-identity"></a>
 **Type identity is *not* affected.** `A | Never` and `A` have different mangled names, different signatures, different witness-table identities — [Spelling is identity](#spelling-is-identity) is preserved at the ABI / Codable declaration order / witness-selection level. The inhabited-subset rule applies only to *call-site reachability decisions*, not to type identity itself. This is the same posture SE-0413 already takes for `throws(Never)`: the function's static type still mentions `Never`, but the call-site `try` requirement is computed from "is the throws set effectively empty?".
 
 This rule answers @Nobody1707's `throws(Err<Never, Never>)` worry from the [pitch thread](https://forums.swift.org/t/pitch-narrowed-any/86369/12) — the enum desugar can't apply this rule because the case constructors are first-class declarations the type-checker has nowhere to hang the collapse on; narrowed-`Any`'s leaf set is visible to the type-checker at every use site, so the rule is mechanical to extend.
 
+<a id="open-question-never-collapse-and-extension-matching"></a>
 **Open question for review** (Pitch-stage TODO, not a fixed v1 commitment): should the inhabited-subset rule extend to extension `where Element == ...` matching? Currently *no* — spelling-as-identity wins, so an extension declared on `Array where Element == Int | Never` does *not* apply to `[Int]` values even though leaf sets are operationally equivalent. Extending Never-collapse to extension lookup would re-introduce an exception that subverts spelling-as-identity. The recommended v1 stance keeps extension matching strict-spelling and routes the user to the [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses) future direction if they explicitly opt in.
 
 **v1 conservatism + two future relaxations.** What v1 *does* give you at constraint position is leaf-set order-freeness: `where T: A | B` and `where T: B | A` are the same constraint. What v1 *does not* give you is (a) full set-membership specialisation — the body sees `T` as the alternation, not as the bound leaf when bound — and (b) cross-spelling matching at extension-`where Element == ...` clauses, where v1 honours [Spelling is identity](#spelling-is-identity). Both relaxations are sketched as Future directions: § [True set-membership for `where T: A | B`](#true-set-membership-for-where-t-a--b) addresses the binding axis, and § [Order-insensitive marker in `where` clauses](#order-insensitive-marker-in-where-clauses) addresses the spelling axis. They are independent and share the same constraint-solver hook (per-binding sorted-leaves identity).
@@ -1011,6 +1020,7 @@ The language change is already done by v1; this is purely a library-evolution fo
 
 When every leaf is small and POD (`Bool | UInt8`, `Int8 | Int16`, `Int32 | Float`), the existential layout is wasteful — a 24-byte inline buffer plus a 1-word metadata pointer (32 bytes total) for what could fit in two-to-eight bytes. An IRGen pass could lay out such narrowed-`Any` values as `discriminator + payload` locally, the way `Optional<Int>` packs into a spare-bit representation today. Cross-module ABI continues to use the existential layout; the optimisation is local-only.
 
+<a id="tagged-union-qualifier-list-is-narrow"></a>
 **The qualifier list is narrow.** Leaf sets that **don't** qualify for this follow-up:
 
 - **Any leaf that isn't POD.** Reference-counted types (`String`, `URL`, classes, `any AnyObject`), types containing reference counts (`String` because of its storage backing, `Optional<class>`, `Array<T>`), and any type whose value-witness table demands non-trivial copy/destroy. Tagging requires the runtime to never look at the value-witness table for storage management; non-POD leaves break that.
@@ -1029,6 +1039,7 @@ When every leaf is small and POD (`Bool | UInt8`, `Int8 | Int16`, `Int32 | Float
 
 So `Int | String`, `URL | Data`, `NetworkError | DecodingError` (where each Error case carries reference-counted message strings or wrapped types) — these stay on the existential layout. The follow-up's primary beneficiaries are typed-throws error sets where every leaf is a small POD enum (status codes, fixed-size error variants), and Embedded Swift workloads that can't tolerate `swift_dynamicCast` regardless of leaf shape.
 
+<a id="tagged-union-required-for-embedded-swift"></a>
 **This layout is required, not just nice-to-have, for Embedded Swift.** Embedded targets restrict dynamic dispatch, existential boxing, and `swift_dynamicCast` — exactly the v1 mechanisms narrowed-`Any` reuses on full-Swift targets. Without the tagged-union layout, Embedded Swift cannot adopt the feature; with it, narrowed-`Any` lands in the same perf regime as a hand-written wrapper enum on Embedded (discriminator + max-payload size, no metadata indirection, no dynamic cast). [SE-0413]'s perf wins are concentrated in single-leaf typed throws (fixed-size stack-resident error, no boxing); the moment a function wraps a multi-case enum to compose multiple error sources, payload + discriminator is already the regime — narrowed-`Any` under tagged-union layout matches that regime, just without the named-wrapper-enum tax. This means:
 
 - **This proposal (v1, full-Swift, no Embedded)** ships with the existential layout + `swift_dynamicCast`. The `O(N+M)` ergonomic improvement over wrapper enums is delivered immediately; the runtime cost vs a hand-written wrapper enum is the existential indirection (an extra metadata pointer + the `swift_dynamicCast` lookup at the catch arm).
