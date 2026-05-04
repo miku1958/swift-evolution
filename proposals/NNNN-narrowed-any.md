@@ -639,6 +639,21 @@ func doBothThings() throws(NetworkError | FilesystemError) {
 
 The runtime thrown value is always *one concrete leaf* — both leaves of `doAnotherThing`'s declared set are accepted by `doBothThings`'s declared set, so the propagation type-checks without cost. This is the same posture [SE-0413] already takes for `throws(SpecificError) → throws(any Error)` widening, generalised from "subtype of `any Error`" to "leaf-set subset of the outer's declared set with per-leaf class/protocol subtyping". Spelling-as-identity still applies at *type-identity* boundaries — value-level cross-shape assignment, protocol-witness conformance, mangling — but those are signature questions, not propagation questions. The composition story in [Motivation](#motivation) (`O(N+M)` rather than `O(N×M)`) leans entirely on this rule: cross-library throws sets compose at the propagation boundary, not at the signature boundary.
 
+<a id="return-position-is-per-leaf-not-per-spelling"></a>
+**Return-position is per-leaf, not per-spelling.** The same value-flow reasoning applies to the `return` boundary. A `return` statement propagates a value out of the inner function into the outer function's declared return slot; the runtime returned value is one concrete leaf, so what matters is whether every inhabited leaf of the inner expression's type fits the outer's declared set, regardless of how either side spelled the alternation. Concretely:
+
+```swift
+func a()   -> Int | String { … }
+func aRev() -> String | Int { … }   // same leaves, different spelling
+func aLeaf() -> Int { … }            // strict subset of leaves
+
+func b1() -> Int | String { return a() }       // same spelling — trivial identity ✓
+func b2() -> Int | String { return aRev() }    // cross-spelling — leaf set agrees, no `as` ✓
+func b3() -> Int | String { return aLeaf() }   // leaf-injection — Int leaf fits the wider set ✓
+```
+
+Just like `try`-propagation, this is the same posture extended to the return boundary: the inner expression's narrowed-`Any` doesn't have to *match* the outer's declared spelling, only have its leaves *fit* it. Spelling-as-identity still applies at the function-type-signature boundary (function-value assignment of `() -> Int | String` to `() -> String | Int` is rejected — spellings differ at the signature level), at protocol-witness conformance, and at mangling; but `return expr` is a value-flow check, not a signature check. Disjoint leaf sets at return position remain a hard error (`func c() -> Bool | Double { return a() }` — the `Int | String` runtime value cannot fit a `Bool | Double` slot).
+
 <a id="uninhabited-never-leaves-and-the-inhabited-subset-rule"></a>
 **Uninhabited (`Never`) leaves and the inhabited-subset rule.** `Never` is the bottom type — no value of type `Never` can be constructed. When `Never` appears as a leaf in a narrowed-`Any`, the runtime can never see a value of that leaf, so call-site **reachability** checks ("can this throw?", "is this case reachable?", "does this cast have any chance of succeeding?") are decided against the *inhabited* subset of the leaf set, not the static leaf set. Concretely:
 
